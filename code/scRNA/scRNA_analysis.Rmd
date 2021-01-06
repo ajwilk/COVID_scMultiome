@@ -1,0 +1,2094 @@
+---
+title: "R Notebook"
+output: html_notebook
+author: Aaron J. Wilk
+---
+
+Multi-omic single-cell analysis of peripheral immune dynamics in SARS-CoV-2 infection
+Please see our preprint at: https://www.biorxiv.org/content/10.1101/2020.12.18.423363v1
+
+This notebook enables reproduction of all figures, supplementary figures, and supplementary tables from the processed Seurat object hosted at: 
+
+Load libraries
+
+```{r libraries}
+library(Matrix)
+library(Matrix.utils)
+library(plyr)
+library(dplyr)
+library(Seurat) 
+library(sctransform)
+library(igraph)
+library(factoextra)
+library(EpicTools) 
+library(ComplexHeatmap)
+library(circlize)
+require(Hmisc)
+require(dplyr)
+require(openxlsx)
+require(ggplot2)
+library(ggpubr)
+require(cowplot)
+library(data.table)
+library(topGO)
+library(RColorBrewer)
+library(ALL)
+library(rowr)
+library(SingleR)
+library(scater)
+library(pheatmap)
+library(nichenetr)
+library(tidyverse)
+library(readr)
+library(flextable)
+library(FlexDotPlot)
+library(phateR)
+library(scales)
+library(SeuratWrappers)
+library(monocle3)
+library(ggsci)
+library(UpSetR)
+library(plotly)
+library(pROC)
+library(SingleCellExperiment)
+library(glue)
+```
+
+### LOAD DATA ###
+First, begin by downloading the processed Seurat object available at: 
+This object is referred to as `covid_combined` in this markdown
+Other data objects are available elsewhere in this repo
+
+### Figure 1 ###
+Panel A is a BioRender image
+```{r panel 1b}
+fig1_path = "~/Figures/Fig1/"
+#panel b
+meta.fig1 <- meta
+meta.fig1$MAX_SEVERITY_SCORE <- as.character(meta.fig1$MAX_SEVERITY_SCORE)
+meta.fig1$Severity.max.final <- mapvalues(meta.fig1$MAX_SEVERITY_SCORE, 
+                                                 from = c("1","2","3","4","5","6","7"), 
+                                                 to = c("1-3","1-3","1-3",
+                                                        "4-5","4-5","6-7","6-7"))
+
+meta.fig1$current_severity <- as.character(meta.fig1$current_severity)
+meta.fig1$Severity.current.final <- mapvalues(meta.fig1$current_severity,
+                                                     from = c("1","2","4","5","6","7"),
+                                                     to = c("1-3","1-3","4-5","4-5","6-7","6-7"))
+
+meta.fig1$acuity <- factor(meta.fig1$acuity, levels = c("Healthy", "Acute", "Convalescent"))
+
+meta.fig1$Severity.max.grouped <- mapvalues(meta.fig1$Severity.max.final, from = c("6-7", "8"), to = c("6-8", "6-8"))
+
+meta.fig1$current_severity_conv <- ifelse(meta.fig1$acuity=="Convalescent", "Convalescent",meta.fig1$Severity.current.final)
+
+ggscatter(meta.fig1, "days_post_pos_test","Age",
+          color = "Severity.max.final", 
+          palette = severity.cols,
+          size = 2.5) + labs(x = "Days post-positive swab") + NoLegend()
+saveit(format = "pdf", height= 3,width=3)
+saveit(format = "pdf", height = 3, width = 3, path = fig1_path, name = "b")
+
+severity.cols <- c("steelblue","green3","yellow3","red","black")
+```
+
+
+```{r panel 1c}
+#panel c --> must plot legend separately
+p <- DimPlot(covid_combined,group.by = "Severity.max.final", cols=severity.cols, reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) 
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+saveit(path = fig1_path, name = "c")
+```
+
+
+```{r panel 1d}
+cell_type_colors <- c(
+    "#D51F26", "#272E6A", "#208A42", "#89288F", "#F47D2B", 
+    "#FEE500", "#8A9FD1", "#C06CAB", "#E6C2DC", "#90D5E4", 
+    "#89C75F", "#F37B7D", "#9983BD", "#D24B27", "#3BBCA8", 
+    "#6E4B9E", "#0C727C", "#7E1416", "#D8A767", "#3D3D3D")
+
+names(cell_type_colors) <-c(
+    "CD14 Monocyte", "CD16 Monocyte", "CD4 T", "CD8 T", "NK", 
+    "B", "PB", "Neutrophil", "Developing neutrophil", "DC", 
+    "pDC", "Eos/Mast Prog", "Prolif Lymph", "Platelet", "Eryth", 
+    "HSPC", "Misc T", "UNUSED", "UNUSED", "UNUSED")
+
+# Lookup for converting fine to broad cell types in ATAC UMAP
+# celltype.fine_to_broad[fine_types] returns the corresponding broad_types
+celltype.fine_to_broad <- c(
+  "B intermediate" = "B","B memory" = "B","B naive" = "B", "Plasmablast" = "PB", "B immature" = "B",
+  "CD4 CTL" = "CD4 T", "CD4 Naive" = "CD4 T", "CD4 TCM" = "CD4 T", "CD4 TEM" = "CD4 T",
+  "CD8 Naive" = "CD8 T","CD8 TCM" ="CD8 T", "CD8 TEM" = "CD8 T",
+  "Proliferating" = "Proliferating", "MAIT" = "Misc T","gdT" = "Misc T", "Treg" = "Misc T","dnT" = "Misc T",
+  "NK" = "NK", "NK_CD56bright" = "NK", "NK_CD56" = "NK",
+  "CD14 Mono" = "CD14 Monocyte","CD16 Mono" = "CD16 Monocyte",
+  "pDC" = "pDC","cDC1" = "DC","cDC2" = "DC","ASDC" = "DC",
+  "Platelet" = "Platelet",
+  "Eryth" = "Eryth",
+  "HSPC" = "HSPC"
+)
+
+#panel d
+p <- DimPlot(covid_combined,group.by = "manual.coarse.idents", reduction = "umap", label = T, repel = T, label.size = 6, cols = cell_type_colors) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) 
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+saveit(path = fig1_path, name = "d")
+```
+
+
+```{r panel 1e}
+#panel e --> must plot legend separately
+covid_combined$cell.type <- covid_combined$manual.coarse.idents
+covid_combined$cell.type <- as.character(covid_combined$cell.type)
+covid_combined$cell.type[covid_combined$cell.type=="Developing neutrophil"] <- "Developing\nneutrophil"
+covid_combined$cell.type[covid_combined$cell.type=="CD16 Monocyte"] <- "CD16 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="CD14 Monocyte"] <- "CD14 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="Eos/Mast Prog"] <- "Eos/Mast\nProg"
+
+meta.use <- covid_combined@meta.data[!(covid_combined$manual.coarse.idents=="Platelet" | covid_combined$manual.coarse.idents=="Neutrophil"),]
+propPlot(meta.use, ncol = 2) + theme(legend.position = "bottom", legend.direction = "vertical")
+saveit(height = 20, width = 7, format = "pdf", name = "e", path = fig1_path)
+```
+
+```{r scATAC panels}
+cell_type_colors <- c(
+  "#D51F26", "#272E6A", "#208A42", "#89288F", "#F47D2B", 
+  "#FEE500", "#8A9FD1", "#C06CAB", "#E6C2DC", "#90D5E4", 
+  "#89C75F", "#F37B7D", "#9983BD", "#D24B27", "#3BBCA8", 
+  "#6E4B9E", "#0C727C", "#7E1416", "#D8A767", "#3D3D3D")
+
+names(cell_type_colors) <-c(
+  "CD14 Monocyte", "CD16 Monocyte", "CD4 T", "CD8 T", "NK", 
+  "B", "PB", "Neutrophil", "Developing neutrophil", "DC", 
+  "pDC", "Eos/Mast Prog", "Prolif Lymph", "Platelet", "Eryth", 
+  "HSPC", "Misc T", "Proliferating", "UNUSED", "UNUSED")
+# Lookup for converting fine to broad cell types in ATAC UMAP
+# celltype.fine_to_broad[fine_types] returns the corresponding broad_types
+celltype.fine_to_broad <- c(
+  "B intermediate" = "B","B memory" = "B","B naive" = "B", "Plasmablast" = "PB", "B immature" = "B",
+  "CD4 CTL" = "CD4 T", "CD4 Naive" = "CD4 T", "CD4 TCM" = "CD4 T", "CD4 TEM" = "CD4 T",
+  "CD8 Naive" = "CD8 T","CD8 TCM" ="CD8 T", "CD8 TEM" = "CD8 T",
+  "Proliferating" = "Proliferating", "MAIT" = "Misc T","gdT" = "Misc T", "Treg" = "Misc T","dnT" = "Misc T",
+  "NK" = "NK", "NK_CD56bright" = "NK", "NK_CD56" = "NK",
+  "CD14 Mono" = "CD14 Monocyte","CD16 Mono" = "CD16 Monocyte",
+  "pDC" = "pDC","cDC1" = "DC","cDC2" = "DC","ASDC" = "DC",
+  "Platelet" = "Platelet",
+  "Eryth" = "Eryth",
+  "HSPC" = "HSPC"
+)
+
+# meta.full <- read.csv("~/Desktop/COVID_sc_metadata/AJW_current_COVID_sc_metadata.csv")
+# atac.embed <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Fig1/scATAC_UMAP_cell_metadata.csv")
+atac.embed[atac.embed$Sample=="ATAC_EV08","current_severity_bin"] <- "0"
+atac.embed[atac.embed$Sample=="ATAC_132D0","current_severity_bin"] <- "1-3"
+
+# atac.translate <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Fig1/atac.donor.translate.csv") %>% mutate_all(as.character)
+atac.embed$Sample <- as.character(atac.embed$Sample)
+atac.embed$Donor <- mapvalues(atac.embed$Sample, 
+                                  from = c(atac.translate$atac.label),
+                                  to = c(atac.translate$Donor))
+
+atac.embed$current_severity.confirm <- mapvalues(atac.embed$Donor, 
+                                                 from = c(as.character(meta.full$Donor),"EV08"), 
+                                                 to = c(as.character(meta.full$current_severity),"0"))
+atac.embed$current_severity_bin.confirm <- mapvalues(atac.embed$current_severity.confirm,
+                                                 from = c("1","2","3","4","5","6","7"), 
+                                                 to = c("1-3","1-3","1-3","4-5","4-5","6-7","6-7"))
+atac.embed$peak_severity <- mapvalues(atac.embed$Donor, 
+                                                 from = c(as.character(meta.full$Donor),"EV08"), 
+                                                 to = c(as.character(meta.full$MAX_SEVERITY_SCORE),"0"))
+atac.embed$peak_severity_bin <- mapvalues(atac.embed$peak_severity,
+                                                 from = c("1","2","3","4","5","6","7"), 
+                                                 to = c("1-3","1-3","1-3","4-5","4-5","6-7","6-7"))
+atac.embed$cell_type_broad <- mapvalues(atac.embed$cell_type, from = names(celltype.fine_to_broad), to = celltype.fine_to_broad)
+
+
+atac.embed$cell_type_broad <- mapvalues(atac.embed$cell_type_broad, 
+                                        from = c("Proliferating", "Misc T","HSPC"),
+                                        to = c(" "," "," "))
+
+#panel h
+data = atac.embed[!atac.embed$is_doublet==T,]
+order = "8"
+col.by = "peak_severity_bin"
+cols.use = severity.cols
+names(cols.use) <- c("0","1-3","4-5","6-7","8")
+order <- rev(x = c(order, setdiff(x = unique(x = data[,
+                col.by]), y = order)))
+data[, col.by] <- factor(x = data[, col.by], levels = order)
+new.order <- order(x = data[, col.by])
+data <- data[new.order, ]
+cols.use <- cols.use[match(unique(data[,col.by]),names(cols.use))]
+
+ggplot(data) + geom_point(mapping = aes_string(x = "UMAP1", y = "UMAP2", color = col.by),size = 0, alpha = 0.2) + guides(color = guide_legend(override.aes = list(size=3,alpha=1))) + 
+  theme_cowplot() + 
+  NoLegend() +
+  scale_color_manual(values = cols.use) + 
+  labs(x = "UMAP1", y = "UMAP2") + 
+  theme(axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title = element_text(size = 20)) 
+saveit(name = "h", path = fig1_path)
+
+#panel i
+data = atac.embed[!atac.embed$is_doublet==T,]
+col.by = "cell_type_broad"
+
+p <- ggplot(data) + geom_point(mapping = aes_string(x = "UMAP1", y = "UMAP2", color = col.by),size = 0, alpha = 0.2) + guides(color = guide_legend(override.aes = list(size=3,alpha=1))) + 
+  theme_cowplot() + 
+  NoLegend() +
+  scale_color_manual(values = cell_type_colors) + 
+  labs(x = "UMAP1", y = "UMAP2") + 
+  theme(axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title = element_text(size = 20)) 
+LabelClusters(plot = p, id = col.by, repel = T, size = 8)
+saveit(name = "i", path = fig1_path)
+```
+
+
+
+### WNN Figure ###
+
+```{r panel 2a}
+wnn_fig_path = "~/Figures/wnn/"
+
+p <- DimPlot(covid_combined, group.by = "celltype.l2", reduction = "mapped.umap", label = T, repel = T, label.size = 7, pt.size = 0)  + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) + NoLegend() + scale_color_igv()
+p$layers[[1]]$aes_params$alpha = .2
+p
+saveit(name = "a",path = wnn_fig_path)
+
+p <- DimPlot(covid_combined, cols = severity.cols, group.by = "Severity.max.final", reduction = "mapped.umap", pt.size = 0)  + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) + NoLegend()
+p$layers[[1]]$aes_params$alpha = .2
+p
+saveit(name = "a2",path = wnn_fig_path)
+```
+
+
+```{r panel 2b}
+pbmc.only <- subset(covid_combined, cells = colnames(covid_combined)[-grep("ACK",colnames(covid_combined))])
+pbmc.only$cell.type <- pbmc.only$celltype.l2
+p <- covid.seuAbundances(pbmc.only, by = "cell.type", group_by = "Severity.current.final", 
+                    meta.include = c("Severity.max.final", "Donor", "orig.ident", 
+                                     "record_id", "Donor.full", 
+                                     "Severity.current.final", "acuity"), 
+                    color_by = "Severity.max.final", each.pt = "Donor.full",
+                    custom_fill_colors = severity.cols,
+                    group_by.point = "Donor", shape_by = "acuity",
+                    correct = F,
+                    comparisons = my_comparisons.current, 
+                    select.idents = c("CD4 Naive","CD4 TCM","CD4 TEM",
+                                      "CD8 Naive","CD8 TCM", "CD8 TEM",
+                                      "dnT","gdT","MAIT",
+                                      "cDC1","cDC2","pDC"),
+                    label.x = 1, pt.size = 3, ncol = 3) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.1))) + 
+  labs(y = "Proportion of PBMCs (%)", x = "WHO severity score at draw") + 
+  theme(text = element_text(size = 20)) + NoLegend() + theme(aspect.ratio = 1)
+
+propPlot(pbmc.only@meta.data, group_by = "Severity.current.final",
+         select.idents = c("CD4 Naive","CD4 TCM","CD4 TEM",
+                                      "CD8 Naive","CD8 TCM", "CD8 TEM",
+                                      "dnT","gdT","MAIT",
+                                      "cDC1","cDC2","pDC"),
+         ncol = 6)
+saveit(format = "pdf",height = 10, width = 15, name = "b",path=wnn_fig_path)
+```
+
+
+```{r score heatmap panel 2c}
+# perturb.score <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/perturb.score.filter_quality_noISG.rds")
+perturb.score.m <- Reduce(cbind,perturb.score )
+colnames(perturb.score.m) <- names( perturb.score  )
+rownames(perturb.score.m) <- mapvalues(rownames(perturb.score.m), from = as.character(rna.meta$Donor), to = as.character(rna.meta$Donor.full))
+
+perturb.filtered <- perturb.score.m[-grep("^H",rownames(perturb.score.m)),]
+anno <- unique(row_annotation[row_annotation$Donor.full %in% rownames(perturb.filtered),])
+anno <- anno[match(rownames(perturb.filtered),anno$Donor.full),]
+ta = columnAnnotation("Peak severity" = anno$Severity.final.max,
+                      "Severity at draw" = anno$Severity.final.current,
+                      "Acuity" = anno$acuity,
+                      col = list("Peak severity" = c("0" = severity.cols[1],
+                                                 "1-3" = severity.cols[2],
+                                                 "4-5" = severity.cols[3],
+                                                 "6-7" = severity.cols[4],
+                                                 "8" = severity.cols[5]),
+                                 "Severity at draw" = c("0" = severity.cols[1],
+                                                 "1-3" = severity.cols[2],
+                                                 "4-5" = severity.cols[3],
+                                                 "6-7" = severity.cols[4]),
+                                 "Acuity" = c("Acute" = "orange",
+                                              "Convalescent" = "purple")))
+
+# rna.marker.list <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/rna.marker.list.filter_quality.noISG.rds")
+
+# get entire RNA perturb/differential genes
+rna.perturb.set <- sapply(rna.marker.list, function(x)  x$gene )
+rna.perturb.set <- unlist(rna.perturb.set)
+names(rna.perturb.set) <- NULL
+rna.perturb.set <- unique(rna.perturb.set)
+
+rna.marker.num <- sapply(rna.marker.list, function(x) nrow(x))
+
+la = rowAnnotation(nDEG = rna.marker.num,
+                   col = list(nDEG=colorRamp2(c(0,quantile(rna.marker.num,0.5),quantile(rna.marker.num,0.8)),
+                                              c("blue","white","red"))))
+
+pdf("~/Downloads/p.pdf", height = 6, width = 9)
+Heatmap(t(abs(perturb.filtered)), 
+        top_annotation = ta,
+        left_annotation = la,
+        col = colorRamp2(breaks = c(0,5,10), colors = c("black","purple","yellow")),
+        name = "Perturbation\nscore",
+        column_names_gp = gpar(fontsize=0))
+dev.off()
+```
+
+
+```{r cdc2 analysis panels 2d-f}
+cells.keep <- colnames(covid_combined)[grep("DC",(covid_combined$celltype.l2))]
+alldc.seu <- subset(covid_combined, cells = cells.keep)
+alldc.seu <- RunPCA(alldc.seu, verbose = F)
+alldc.seu <- RunUMAP(alldc.seu, verbose = F, dims = 1:50)
+
+#panel d
+p1 <- DimPlot(alldc.seu,group.by = "Severity.max.final", cols=severity.cols, reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+
+p2 <- DimPlot(alldc.seu,group.by = "celltype.l2", label = T, repel = T, reduction = "umap", label.size = 10) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend() + scale_color_igv() + theme(text = element_text(face = "bold")) + theme(axis.title.x = element_text(face = "plain"), axis.title.y = element_text(face = "plain"))
+
+CombinePlots(list(p1,p2))
+saveit(name = "d", path = wnn_fig_path, height = 5, width = 10)
+
+#panel e
+alldc.seu$celltype.l2.factor <- factor(alldc.seu$celltype.l2, levels=rev(c("cDC1","cDC2","pDC","ASDC")))
+DotPlot(alldc.seu, features = rev(c("SIGLEC6","AXL","IL3RA","TCF4","CD1C","CLEC9A")), group.by = "celltype.l2.factor", scale.max = 20, cols = "RdYlBu", dot.scale = 15, assay = "RNA") + labs(x=NULL,y=NULL) + RotatedAxis() + theme(axis.text.x = element_text(size = 20, face = "italic"), axis.text.y = element_text(size=20))
+saveit(format = "pdf", name = "e", path = wnn_fig_path, height = 5, width = 10)
+
+#panel f
+cdc2.seu <- subset(covid_combined, cells = colnames(covid_combined)[covid_combined$celltype.l2=="cDC2"])
+cdc2.seu <- RunPCA(cdc2.seu, verbose = F)
+cdc2.seu <- RunUMAP(cdc2.seu, verbose = F, dims = 1:50)
+cdc2.seu <- FindNeighbors(cdc2.seu, verbose = F, dims = 1:50)
+cdc2.seu <- FindClusters(cdc2.seu, verbose = F)
+cdc2.seu <- NormalizeData(cdc2.seu, assay = "RNA")
+
+
+FeatureBoxPlot(cdc2.seu, features = c("FCER1A","CD83","CTSS","PKM","HLA-DRA","HLA-DQA1","HLA-DPA1","HLA-DPB1"), ncol = 4) + NoLegend() + theme(aspect.ratio = 1) + labs(x = "Maximum WHO Ordinal Score") + theme(text = element_text(size = 20))
+saveit(format = "pdf", height = 6, width = 12, name = "f", path = wnn_fig_path)
+
+```
+
+PKM loss required for DC activation, marker of exhaustion/dysfunction: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5646285/ and https://www.nature.com/articles/s41467-018-06406-8
+
+### Monocyte figure ###
+```{r panel 3a}
+mono_fig_path = "~/Figures/mono"
+
+covid_CD14mono <- subset(covid_combined, idents = c("1", "4", "11"))
+covid_CD14mono <- RunPCA(covid_CD14mono, verbose = FALSE)
+covid_CD14mono <- RunUMAP(covid_CD14mono, dims = 1:50, verbose = FALSE)
+covid_CD14mono <- FindNeighbors(covid_CD14mono, dims = 1:50, verbose = FALSE)
+covid_CD14mono <- FindClusters(covid_CD14mono, resolution = 1, verbose = FALSE)
+covid_CD14mono <- update.metadata(covid_CD14mono)
+
+p <- DimPlot(covid_CD14mono,group.by = "Severity.max.final", cols=severity.cols, pt.size = 0) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_text(size = 20)) + theme(legend.position = c(.9,.8)) + NoLegend()
+p$layers[[1]]$aes_params$alpha = .75
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "a",path = mono_fig_path,width = 7, height = 7)
+```
+
+
+```{r panel 3b,e}
+myFeaturePlot(covid_CD14mono, features = c("IFI27","IFITM3","CD163", "ARG1", "PLAC8", "MPO", "HLA-DRA", "CD4", "IL1B", "IL6", "CCL3", "TNF"), ncol = 2, height = 21*.75, width = 8*.75)
+```
+
+
+```{r panel 3c,f}
+FeatureBoxPlot(covid_CD14mono, features = c("IFI27","IFITM3","CD163", "ARG1", "PLAC8", "MPO", "HLA-DRA", "CD4", "IL1B", "IL6", "CCL3", "TNF"), ncol = 2) + theme(aspect.ratio = 1, text = element_text(size = 25), strip.text = element_text(size = 29)) + theme(legend.position = "bottom", legend.box = "vertical")
+saveit(height = 25, width = 8, name = "c", path = mono_fig_path, format = "pdf")
+```
+
+
+```{r panel 3d}
+mdsc.set #can be found in Supplementary Table 12
+covid_CD14mono <- AddModuleScore(covid_CD14mono, features = list(mdsc.set$gene), name = "mdsc")
+
+sepsis.set  #can be found in Supplementary Table 12
+covid_CD14mono <- AddModuleScore(covid_CD14mono, features = list(sepsis.set), name = "sepsis")
+FeatureBoxPlot(covid_CD14mono, features = c("sepsis1","mdsc1")) + theme(text = element_text(size=25), aspect.ratio = 1, strip.text = element_text(size = 0)) + NoLegend() + labs(y = "Mean module score")
+saveit(name = "d", format = "pdf", width = 9, height = 4.5,path=mono_fig_path)
+```
+
+### NK cell figure ###
+```{r panel 4a}
+nk_fig_path = "~/Figures/NKcell/"
+
+real.nk.cells <- colnames(covid_combined)[grep("^NK",covid_combined$celltype.l3)]
+real.nk.cells <- real.nk.cells[!real.nk.cells %in% colnames(covid_combined)[grep("eutrophil$",covid_combined$manual.coarse.idents)]]
+covid_NK <- subset(covid_combined, cells = real.nk.cells)
+covid_NK <- RunPCA(covid_NK, verbose = F)
+covid_NK <- RunUMAP(covid_NK, verbose = F, dims = 1:50)
+covid_NK <- FindNeighbors(covid_NK)
+covid_NK <- FindClusters(covid_NK)
+
+
+#panel A
+pbmc.only$cell.type <- pbmc.only$celltype.l2
+covid.seuAbundances(pbmc.only, by = "cell.type", group_by = "Severity.current.final", 
+                    meta.include = c("Severity.max.final", "Donor.coarse", "orig.ident", "record_id", "acuity", "Severity.current.final"), 
+                    color_by = "Severity.max.final", 
+                    custom_fill_colors = severity.cols,
+                    group_by.point = "Donor.coarse", 
+                    correct = F, shape_by = "acuity",
+                    comparisons = my_comparisons.current, 
+                    label.x = 1, pt.size = 3, 
+                    select.idents = c("NK"),
+                    ncol = 3) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.2))) + 
+  labs(color = "Donor", x = "WHO severity score at draw") + 
+  theme(text = element_text(size = 20), aspect.ratio = 1) + NoLegend()
+saveit(name = "a",path = nk_fig_path, height = 3.5, width = 4.5,format = "pdf")
+
+
+#panel A (ATAC) --> these objects may be instantiated below in the ATAC supplement section
+cell_metadata$cell.type <- cell_metadata$cell_type
+cell_metadata$acuity <- factor(cell_metadata$acuity, levels = c("Healthy", "Acute"))
+propPlot(cell_metadata, each.pt = "Sample", group_by = "current_severity_bin", color_by = "peak_severity_bin", select.idents = "NK") + labs(y = NULL, x = NULL) + NoLegend()
+saveit(height = 3, width = 3, name = "a_ATAC", path = nk_fig_path, format = "pdf")
+```
+
+
+```{r panel 4b}
+#panel B
+DimPlot(covid_NK,group.by = "Severity.max.final", cols=severity.cols, reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + theme(aspect.ratio = 1) + NoLegend()
+saveit(name = "b",path = nk_fig_path)
+
+myFeaturePlot(covid_NK, features = c("FCGR3A","NCAM1","GZMB","PRF1","MKI67", "XAF1"), ncol = 2)
+```
+
+
+```{r panel 4c}
+covid_NK <- AddModuleScore(covid_NK, features = list(c("HAVCR2", "PDCD1","LAG3")), name = "NKexh", nbin = 10)
+FeatureBoxPlot(covid_NK, features = c("IFN1", "NKexh1")) + NoLegend() + labs(y = "Average module score")
+saveit(height = 4, width = 6, format = "pdf", name = "c", path = nk_fig_path)
+```
+
+
+```{r panel 4h}
+FeatureBoxPlot(covid_NK, features = c("CD226","KLRK1")) + NoLegend()
+saveit(height = 4, width = 6, format = "pdf", name = "h", path = nk_fig_path)
+saveit(height = 4, width = 6, format = "pdf")
+```
+
+### Neutrophil figure ###
+
+```{r panel 5a}
+neut_fig_path = "~/Figures/Neutrophil/"
+
+#panel A
+myFeaturePlot(covid_combined, features = c("CSF3R","CXCR2","FCGR3B"),ncol = 3, width = 10, height = 10/3, reduction = "umap")
+
+p <- DimPlot(neut_alone,group.by = "Severity.max.final", cols=severity.cols) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) 
+p$layers[[1]]$aes_params$alpha = .75
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "a",path = neut_fig_path)
+# (outlines are drawn in illustrator)
+```
+
+
+```{r panel 5b}
+#panel B
+neut.markers <- build.deg.matrix(compartment = "Neut")
+new.markers.heatmap(neut.markers[,-grep("^H",colnames(neut.markers))], top.n = 60)
+```
+
+
+```{r panel 5c}
+#panel C
+myFeaturePlot(neut_alone, features = c("IFIT2","IFITM3","IFI44","S100A9","CD274","IL1R2"),ncol = 3,height = 10*(2/3), width = 10)
+
+FeatureBoxPlot(neut_alone, features = c("IFIT2","IFITM3","IFI44","S100A9","CD274","IL1R2","PADI4","CXCR1"), ncol = 4)
+saveit(format = "pdf", height = 7, width = 12)
+```
+
+
+```{r panel 5d}
+my_comparisons.grouped <- list(c("0","1-3"),
+                               c("0","4-5"),
+                               c("0","6-8"))
+#panel D
+covid_combined$cell.type <- covid_combined$manual.coarse.idents
+p1 <- covid.seuAbundances.nonprop(covid_combined, by = "cell.type", group_by = "Severity.max.grouped", 
+                            non.prop.data = "IFN1", # precalculated in covid_combined using genes in Table S12
+                    meta.include = c("Severity.max.final", "Donor", 
+                                     "orig.ident", "record_id", "Donor.full",
+                                     "Severity.max.grouped", "acuity"), 
+                    color_by = "Severity.max.final", each.pt = "Donor.full",
+                    custom_fill_colors = severity.cols,
+                    group_by.point = "Donor", shape_by = "acuity",
+                    correct = F, 
+                    comparisons = my_comparisons.grouped, 
+                    label.x = 1, pt.size = 3, select.idents = "Neutrophil") + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.075))) + 
+  labs(y = "Mean ISG module score", x = "Maximum WHO Ordinal Score") + 
+  theme(text = element_text(size = 20)) + NoLegend()
+
+p1 <- FeatureBoxPlot(neut_alone, features = "IFN1") + labs(y = "Mean ISG module score") + NoLegend() + theme(strip.text = element_text(size = 0))
+covid.only <- subset(covid_combined, cells = colnames(covid_combined)[-grep("^H",colnames(covid_combined))])
+covid.only$days_post_pos_test <- as.numeric(covid.only$days_post_pos_test)
+covid.only$cell.type <- covid.only$cell.type.coarse
+p2 <- covid.seuAbundances.nonprop.num(covid.only, by = "cell.type", group_by = "days_post_pos_test", 
+                            non.prop.data = "IFN1",
+                    meta.include = c("Severity.max.final", "Donor", "orig.ident", 
+                                     "record_id", "Donor.full",
+                                     "days_post_pos_test","Donor.coarse",
+                                     "acuity"), 
+                    color_by = "Severity.max.final", each.pt = "Donor.full",
+                    custom_fill_colors = severity.cols[-1], shape_by = "acuity",
+                    group_by.point = "Donor.coarse", 
+                    correct = F, 
+                    comparisons = my_comparisons.grouped, 
+                    label.x = 20, pt.size = 3, label_size = 1,
+                    select.idents = "Neutrophil") + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.075))) + 
+  labs(y = "Mean ISG module score", x = "Days post-positive swab") + 
+  theme(text = element_text(size = 20),aspect.ratio = 1, strip.text = element_text(size = 0)) + NoLegend()
+
+CombinePlots(list(p1,p2))
+saveit(name = "d",path = neut_fig_path,height = 4.25, width = 8.5, format = "pdf")
+```
+
+```{r panel 5e}
+#panel E
+phagocytosis_genes #see Table S12
+neut_degranulation_genes #see Table S12
+
+covid_combined <- AddModuleScore(covid_combined, features = list(phagocytosis_genes), name = "phagocytosis")
+covid_combined <- AddModuleScore(covid_combined, features = list(neut_degranulation_genes), name = "neut_degranulation")
+neut_alone <- update.metadata(neut_alone)
+
+FeatureBoxPlot(neut_alone, features = c("neut_degranulation1", "phagocytosis1"), facet.face = "plain") + NoLegend() + labs(y = "Mean module score") + theme(strip.text = element_text(size =0))
+saveit(name = "e",path = neut_fig_path,height = 4.25, width = 8.5, format = "pdf")
+```
+
+
+```{r panel 5f}
+#panel F
+DotPlot(neut_alone, features = rev(c("TNFSF10", "TNFSF13B","CXCL16")), group.by = "Severity.max.final", assay = "RNA") + ggpubr::rotate_x_text() + labs(x = NULL, y = "Peak WHO Severity Score") + theme(axis.text.x = element_text(face = "italic", size = 15), axis.text.y = element_text(size = 15), axis.title.y = element_text(size = 15))
+saveit(format = "pdf", height = 4.5, width = 4.5, name = "f",path = neut_fig_path)
+
+DotPlot(neut_alone, features = (c("FYN", "PRMT7", "FTO", "ATM", "DZIP3", "NAT10", "CHD6", "KDM2B", "BUB1", "DTX3L", "JMJD6", "LIMK2", "BAZ1A", "PPP4R2", "JAK2", "HDAC4", "PADI4", "KDM6B", "TDRD7")), group.by = "Severity.max.final", scale.max = 30, assay = "RNA") + rotate_x_text() + labs(x = NULL, y = "Peak WHO Severity Score") + theme(axis.text.x = element_text(face = "italic", size = 15), axis.text.y = element_text(size = 15), axis.title.y = element_text(size = 15))
+saveit(format = "pdf", height = 4, width = 7, name = "f2",path = neut_fig_path)
+```
+
+Grabbing module scores
+```{r panel 5h}
+#PD-L1+ Neutrophils
+pdl1.features #see Table S12
+neut_alone <- AddModuleScore(neut_alone, name = "pdl", features = list(pdl1.features$gene))
+
+
+#ARDS Neuts (Juss et al.)
+juss.features #see Table S12
+neut_alone <- AddModuleScore(neut_alone, name = "juss", features = list(juss.features$Gene.symbol))
+
+FeatureBoxPlot(neut_alone, features = c("pdl1", "juss1")) + NoLegend() + labs(y = "Mean module score") + theme(strip.text = element_text(size = 0))
+
+saveit(name = "h",path = neut_fig_path,height = 4.25, width = 8.5, format = "pdf")
+```
+
+
+### Hematopoiesis Figure ###
+Additional analyses in heme RMarkdown
+Developing neutrophil latent time
+Anything commented out in this figure reflects the replacement of developing neutrophil analysis
+```{r panel 6a}
+heme_fig_path = "~/Figures/Heme/"
+
+#panel a
+covid_combined$cell.type <- covid_combined$manual.coarse.idents
+covid_combined$cell.type <- as.character(covid_combined$cell.type)
+covid_combined$cell.type[covid_combined$cell.type=="Developing neutrophil"] <- "Developing\nneutrophil"
+covid_combined$cell.type[covid_combined$cell.type=="CD16 Monocyte"] <- "CD16 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="CD14 Monocyte"] <- "CD14 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="Eos/Mast Prog"] <- "Eos/Mast\nProg"
+covid.seuAbundances(covid_combined, by = "cell.type", group_by = "Severity.current.final", 
+                    meta.include = c("Severity.max.final", "Donor.coarse", "record_id", "acuity", "orig.ident", "Severity.current.final", "Donor", "Donor.full"), 
+                    color_by = "Severity.max.final", 
+                    custom_fill_colors = severity.cols,
+                    group_by.point = "Donor", 
+                    each.pt = "Donor.full",
+                    correct = F, 
+                    comparisons = my_comparisons.current,
+                    #select.idents = setdiff(unique(covid_combined$cell.type),"Neutrophil"),
+                    select.idents = c("Developing\nneutrophil"),
+                    label.x = 1, pt.size = 3, shape_by = "acuity") + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.075))) + 
+  labs(color = "Severity\nscore", x = "WHO severity score at draw", shape = "Acuity") + 
+  theme(text = element_text(size = 20), aspect.ratio = 1) + NoLegend() 
+
+saveit(format = "pdf",height = 4.5, width = 4.75, name = "a",path=heme_fig_path)
+```
+
+
+```{r panels 6b-c}
+data_run <- t(GetAssayData(devneut_alone.nc2, assay = "SCT", slot = "scale.data"))
+data_phate <- phate(data_run)
+
+devneut_alone.nc2[["phate"]] <- CreateDimReducObject(embeddings = data_phate$embedding, key = "PHATE_")
+
+#panel b
+DimPlot(devneut_alone.nc2, cols = severity.cols, group.by = "Severity.max.final", reduction = "phate")  + labs(x = "PHATE1", y = "PHATE2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + NoLegend()
+saveit(height = 5, width = 5,name = "b",path = heme_fig_path)
+
+#panel c
+DimPlot(devneut_alone.nc2, label = T, repel = T, reduction = "phate", label.size = 15)  + labs(x = "PHATE1", y = "PHATE2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + NoLegend() + scale_color_igv() + theme(text = element_text(face = "bold")) + theme(axis.title.x = element_text(face = "plain"), axis.title.y = element_text(face = "plain"))
+saveit(height = 5, width = 5,name = "c",path = heme_fig_path)
+```
+
+
+```{r panel 6d}
+# devneut.cluster.markers <- FindAllMarkers(devneut_alone.nc2, only.pos = T)
+# devneut.cluster.markers <- devneut.cluster.markers[-grep("^HB",devneut.cluster.markers$gene),]
+# devneut.cluster.markers.filtered <- devneut.cluster.markers %>% filter_quality()
+top.genes <- devneut.cluster.markers.filtered %>% group_by(cluster) %>% top_n(10,avg_logFC)
+top.genes$cluster <- factor(top.genes$cluster, levels = c("0","1","2","3","4"))
+top.genes <- top.genes %>% arrange(cluster)
+genes.plot <- unique(top.genes$gene)
+devneut_alone.nc2$cluster_factor <- factor(devneut_alone.nc2$seurat_clusters, levels = rev(c("0","1","2","3","4")))
+# DotPlot(devneut_alone.nc2, features = (genes.plot), cols = "RdYlBu", group.by = "cluster_factor", dot.scale = 8) + RotatedAxis() + labs(y = "Cluster", x = NULL) + theme(axis.text.x = element_text(size = 15, face = "italic"), axis.text.y = element_text(size = 15))
+
+DotPlot(devneut_alone.nc2, features = c("IGLC3","ELANE","CTSG","AZU1","MPO","DEFA4","DEFA1","DEFA1B","DEFA3","SRGN","NUCB2","BPI","MS4A3","CEACAM6","HMGN2","MKI67","OLFM4","CEACAM8","ABCA13","RETN","LYZ","LTF","CAMP","LCN2","MMP8","PADI4","S100A9","CYBB","CRISP3","TCN1","S100A8","HP","S100A12","MMP9","SELL","B2M","FCGR3B","TXNIP","AHNAK","VCAN","NAMPT","DUSP1","NAMPTL","NEAT1"), cols = "RdYlBu", group.by = "cluster_factor", dot.scale = 8, assay = "RNA") + RotatedAxis() + labs(y = "Cluster", x = NULL) + theme(axis.text.x = element_text(size = 15, face = "italic"), axis.text.y = element_text(size = 15))
+saveit(format = "pdf", height = 4, width = 16, name = "d", path = heme_fig_path)
+```
+
+```{r panels 6e-g}
+#panel e
+FeaturePlot(devneut_alone.nc2, features = "latent_time", reduction = "phate", 
+            cols = "RdYlBu", min.cutoff = 0, max.cutoff = 1) + 
+  xlim(c(-0.027,0.045)) + ylim(c(-0.012,0.0175)) +
+  labs(x = "PHATE1", y = "PHATE2") + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+        axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        aspect.ratio = 1,
+        axis.title = element_text(size = 20)) +
+  labs(title = NULL) + scale_color_gradientn(colors = c("blue","yellow","red"))
+saveit(height = 5, width = 5,name = "e",path = heme_fig_path)
+
+
+latent_time <- read.csv("~/Downloads/latent_time.csv", row.names = 1)
+devneut_alone.nc$latent_time <- latent_time$latent_time
+t <- devneut_alone.nc2$latent_time
+
+#panel f
+plot_traj_genes(genes = c("DEFA1B","LTF","MMP9","CSF3R"), seu = devneut_alone.nc2) + theme(text = element_text(size = 20),aspect.ratio = 1)
+saveit(width = 5.5, height = 4.5,name = "f",path = heme_fig_path,format = "pdf")
+
+#panel g
+plot_traj_genes(genes = c("CEBPB","CEBPD","CEBPE"), seu = devneut_alone.nc2) + theme(text = element_text(size = 20),aspect.ratio = 1)
+saveit(width = 5.5, height = 4.5,name = "g",path = heme_fig_path,format="pdf")
+```
+
+
+```{r panel 6h}
+covid_combined$cell.type <- covid_combined$celltype.l3
+p <- covid.seuAbundances(covid_combined, by = "cell.type", group_by = "Severity.current.final", 
+                    meta.include = c("Severity.max.final", "Donor", "orig.ident", 
+                                     "record_id", "Donor.full", 
+                                     "Severity.current.final", "acuity"), 
+                    color_by = "Severity.max.final", each.pt = "Donor.full",
+                    custom_fill_colors = severity.cols, shape_by = "acuity",
+                    group_by.point = "Donor", 
+                    correct = F,
+                    comparisons = my_comparisons.current, 
+                    label.x = 1, pt.size = 3, select.idents = c("HSPC")) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.075))) + 
+  labs(y = "Proportion of all cells (%)", x = "WHO severity score at draw") + 
+  theme(text = element_text(size = 20)) + theme(aspect.ratio = 1) + NoLegend()
+
+saveit(format = "pdf",height = 4.5, width = 4.5, name = "f",path=heme_fig_path)
+```
+
+```{r panel 6j}
+cells.subset <- colnames(covid_combined)[covid_combined$celltype.l2=="HSPC"]
+cells.subset <- cells.subset[!cells.subset %in% colnames(covid_combined)[grep("eutrophil",covid_combined$manual.coarse.idents)]]
+HSPC.seu <- subset(covid_combined, cells = cells.subset)
+HSPC.seu <- RunPCA(HSPC.seu, verbose = F)
+HSPC.seu <- RunUMAP(HSPC.seu, verbose = F, dims = 1:50)
+HSPC.seu <- FindNeighbors(HSPC.seu, verbose = F, dims = 1:50)
+HSPC.seu <- FindClusters(HSPC.seu, verbose = F)
+HSPC.seu <- NormalizeData(HSPC.seu, assay = "RNA")
+
+FeatureBoxPlot(HSPC.seu, features = c("CDK6", "SOX4", "CHD4", "HNRNPA2B1", "PTMA", "YBX1"), ncol = 3)
+saveit(format = "pdf",height = 5, width = 11,name = "i",path = heme_fig_path)
+```
+
+
+CDK6 key regulator of HSC quiescence. Long-term HSCs lack CDK6: https://pubmed.ncbi.nlm.nih.gov/25704240/
+YBX3 associated with HSC cell cycle quiescence. Promotes G0 phase: https://stemcellsjournals.onlinelibrary.wiley.com/doi/full/10.1002/stem.2302#stem2302-fig-0007
+HSP90AA1 marks stress-response in HSC: https://www.nature.com/articles/cddis2016377
+SOX4 critical for HSC maintenance: https://www.nature.com/articles/onc2012506
+CHD4 required for HSC maintenance and multi-lineage differentiation: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4386592/ AND https://pubmed.ncbi.nlm.nih.gov/18451107/
+HNRNPA2B1 amplifies innate immune responses to DNA viruses: https://science.sciencemag.org/content/365/6454/eaav0758
+YBX1 also required for HSC maintenance, knockout lowers proliferative capacity and induces apoptosis: https://pubmed.ncbi.nlm.nih.gov/21369783/
+PTMA potentiates transcriptional activity required for HSC maintenance: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2680389/
+
+
+```{r panel 6k-m prep}
+heme <- readRDS("~/scRNA-Healthy-Hematopoiesis-191120.rds") #available at https://jeffgranja.s3.amazonaws.com/MPAL-10x/Supplementary_Data/Healthy-Data/scRNA-Healthy-Hematopoiesis-191120.rds
+cells.keep <- colnames(heme.seu)[heme.seu$Group=="CD34_D2T1" | heme.seu$Group=="CD34_D3T1"]
+heme.seu <- subset(heme.seu, cells = cells.keep)
+heme.seu <- RunPCA(heme.seu, verbose = F)
+heme.seu <- RunUMAP(heme.seu, verbose = F, dims = 1:30)
+heme.list <- list(heme.seu, HSPC.seu)
+names(heme.list) <- c("heme.seu","HSPC.seu")
+
+for (i in 1:length(heme.list)) {
+    heme.list[[i]] <- SCTransform(heme.list[[i]], verbose = FALSE)
+}
+heme.features <- SelectIntegrationFeatures(heme.list, nfeatures = 3000)
+heme.list <- PrepSCTIntegration(heme.list, anchor.features = heme.features, verbose = F)
+
+heme.anchors <- FindIntegrationAnchors(object.list = heme.list, normalization.method = "SCT", anchor.features = heme.features, verbose=F)
+heme.integrated <- IntegrateData(anchorset = heme.anchors, normalization.method = "SCT", verbose = F)
+# DefaultAssay(heme.integrated) <- "integrated"
+
+heme.integrated <- RunPCA(heme.integrated, npcs = 30, verbose = FALSE)
+heme.integrated <- RunUMAP(heme.integrated, reduction = "pca", dims = 1:30)
+heme.integrated <- FindNeighbors(heme.integrated, verbose = F, dims = 1:30)
+heme.integrated <- FindClusters(heme.integrated, verbose = F)
+
+heme.integrated$source <- ifelse(is.na(heme.integrated$BioClassification),"COVID","Heme")
+heme.integrated$Severity.max.final <- ifelse(is.na(heme.integrated$BioClassification),heme.integrated$Severity.max.final,"0")
+heme.integrated$covid.celltype <- heme.integrated$celltype.l3
+# heme.integrated$covid.celltype <- ifelse(heme.integrated$manual.coarse.idents=="Developing neutrophil","Developing neutrophil",heme.integrated$covid.celltype)
+heme.integrated$all.celltype <- ifelse(is.na(heme.integrated$BioClassification),heme.integrated$covid.celltype,heme.integrated$BioClassification)
+
+heme.query <- heme.list[["HSPC.seu"]]
+heme.transfer.anchors <- FindTransferAnchors(heme.integrated, query = heme.query, dims = 1:30)
+predictions <- TransferData(anchorset = heme.transfer.anchors, refdata = heme.integrated$BioClassification, dims = 1:30)
+HSPC.seu$predicted.id <- predictions$predicted.id
+```
+
+```{r panels 6k-l}
+heme.integrated$cell.type <- heme.integrated$BioClassification
+heme.integrated$cell.type <- gsub(".*_","",heme.integrated$cell.type)
+heme.integrated$cell.type <- gsub("1$","",heme.integrated$cell.type)
+heme.integrated$cell.type <- gsub("2$","",heme.integrated$cell.type)
+heme.integrated$cell.type <- gsub("\\."," ",heme.integrated$cell.type)
+heme.integrated$cell.type <- mapvalues(heme.integrated$cell.type, 
+                                       from = c("B","CD14 Mono ","cDC","Pre B"),
+                                       to = c(" ", " ", " ", " "))
+
+DimPlot(heme.integrated, reduction = "umap", group.by = "cell.type", label = T, repel = T, label.size = 8, pt.size = 0) + NoLegend() + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(),axis.title = element_text(size = 20))  + scale_color_manual(values = heme_type_colors)
+saveit(height = 6, width = 6, name = "k", path = heme_fig_path)
+
+
+DimPlot(heme.integrated, reduction = "umap", group.by = "covid.celltype", cols = c("red","lightgrey"), na.value = "grey90", pt.size = 1) + NoLegend() + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(),axis.title = element_text(size = 20)) 
+saveit(height = 6, width = 6, name = "l", path = heme_fig_path)
+```
+
+```{r panels 6m}
+heme_type_colors <- c(
+  "#D51F26", "#272E6A", "#208A42", "#89288F", "#F47D2B", 
+  "#FEE500", "#8A9FD1", "#C06CAB", "#E6C2DC", "#90D5E4", 
+  "#89C75F", "#F37B7D", "#9983BD", "#D24B27", "#3BBCA8", 
+  "#6E4B9E", "#0C727C", "#7E1416", "#D8A767", "#3D3D3D")
+
+names(heme_type_colors) <-c(
+  "CMP LMPP", "GMP", "CLP ","pDC","Early Eryth",
+  "GMP Neut","HSC","Early Baso","Late Eryth"," ",
+  rep("UNUSED",10))
+
+fq <- prop.table(table(HSPC.seu@meta.data$predicted.id, HSPC.seu@meta.data[,"Severity.max.final"]), 2) *100
+df <- reshape2::melt(fq, value.name = "freq", varnames = c("cell.type", 
+                                                       "Severity.max.final"))  
+
+df$cell.type <- gsub(".*_","",df$cell.type)
+df$cell.type <- gsub("1$","",df$cell.type)
+df$cell.type <- gsub("2$","",df$cell.type)
+df$cell.type <- gsub("\\."," ",df$cell.type)
+p <- ggplot(df, aes_string(y = "freq", x = "Severity.max.final")) + 
+  labs(x = NULL, y = "Proportion (%)") + 
+  theme_bw() + 
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(), 
+        strip.background = element_rect(fill = NA, color = NA), 
+        strip.text = element_text(face = "bold"), 
+        axis.ticks.x = element_blank(), axis.text = element_text(color = "black"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+p + geom_bar(aes_string(x = "Severity.max.final", fill = "factor(cell.type)"), 
+                        position = "fill", stat = "identity") + 
+  scale_y_continuous(expand = c(0, 0), labels = seq(0, 100, 25)) + 
+  theme(panel.border = element_blank()) + 
+  scale_fill_manual(values=heme_type_colors) + labs(fill = "Cell type", x = "Maximum WHO Severity Score")
+
+saveit(height = 3, width = 4, format = "pdf", name = "m", path = heme_fig_path)
+```
+
+### Supplemental Figure 1 ###
+```{r upset}
+supp_1_path = "~/Figures/Supplement/1"
+# rna.meta.upset <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Supplement/1/rna_meta.csv")
+# atac.meta.upset <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Supplement/1/atac_meta.csv")
+# atac.meta.upset <- atac.meta.upset[atac.meta.upset$record_id %in% atac.embed$Donor,]
+# cytof.meta.upset <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Supplement/1/cytof_meta.csv")
+# meta.upset <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/AJW_current_COVID_sc_metadata.csv")
+meta.upset$record_id <- meta.upset$Donor
+
+df <- data.frame(record_id = unique(c(as.character(rna.meta.upset$record_id),
+                                      as.character(atac.meta.upset$record_id),
+                                      as.character(cytof.meta.upset$record_id))))
+df$scRNA <- ifelse(df$record_id %in% rna.meta.upset$record_id,1,0)
+df$scATAC <- ifelse(df$record_id %in% atac.meta.upset$record_id,1,0)
+df$CyTOF <- ifelse(df$record_id %in% cytof.meta.upset$record_id,1,0)
+df <- merge(df,meta.upset[,c("record_id","MAX_SEVERITY_SCORE")],by="record_id",all.x=T)
+df[is.na(df$MAX_SEVERITY_SCORE),"MAX_SEVERITY_SCORE"] <- "0"
+
+
+
+df$Severity <- mapvalues(df$MAX_SEVERITY_SCORE, 
+                         from = c("0","1","2","3","4","5","6","7","8"),
+                         to = c("0","1-3","1-3","1-3","4-5","4-5","6-7","6-7","8"))
+
+pdf("~/Figures/Supplement/1/upset.pdf", width =5, height = 4)
+ComplexUpset::upset(df,c("scRNA", "scATAC", "CyTOF"),
+                    name = "Modality",
+                    base_annotations = list(
+                      'Intersection size'=intersection_size(counts=F,
+                                                            aes=aes(fill=Severity))
+                    )) & scale_fill_manual(values=severity.cols)
+dev.off()
+
+
+```
+
+```{r table}
+curr.meta <- meta.upset
+curr.meta$Severity.max.final <- mapvalues(curr.meta$MAX_SEVERITY_SCORE, 
+                                          from = c("1","2","3","4","5","6","7"), 
+                                          to = c("1-3","1-3","1-3",
+                                                 "4-5","4-5","6-7","6-7"))
+
+curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(Age), funs(median(.,na.rm=T),quantile(.,.25),quantile(.,.75)))
+
+curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(Sex), funs(table(.)))
+
+fq <- prop.table(table(curr.meta$Severity.max.final, curr.meta$race_final), 1) *100
+df <- reshape2::melt(fq, value.name = "freq", varnames = c("Severity", 
+                                                           "race_final")) 
+
+curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(BMI), funs(median(.,na.rm=T),quantile(.,.25,na.rm=T),quantile(.,.75,na.rm=T))) 
+
+curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(DIALYSIS), funs(table(.)))
+
+(curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(HOSP_IN_HOURS), funs(median(.,na.rm=T),quantile(.,.25,na.rm=T),quantile(.,.75,na.rm=T))) %>% column_to_rownames(var = "Severity.max.final"))/24
+
+curr.meta %>% group_by(Severity.max.final) %>% summarise_at(vars(), funs(median(.,na.rm=T),quantile(.,.25,na.rm=T),quantile(.,.75,na.rm=T))) 
+```
+
+```{r dotPlot}
+Idents(covid_combined) <- "manual.coarse.idents"
+rna.markers <- FindAllMarkers(covid_combined, only.pos = T, assay = "RNA") %>% filter_quality()
+Idents(covid_combined) <- "seurat_clusters"
+
+rna.markers <- rna.markers[-grep("^HB",rna.markers$gene),]
+top.genes <- rna.markers %>% group_by(cluster) %>% top_n(5,avg_logFC)
+top.genes$cluster <- factor(top.genes$cluster, levels = sort(unique(covid_combined$manual.coarse.idents)))
+top.genes <- top.genes %>% arrange(cluster)
+genes.plot <- unique(top.genes$gene)
+covid_combined$manual.coarse.idents_factor <- factor(covid_combined$manual.coarse.idents, levels = sort(unique(covid_combined$manual.coarse.idents)))
+DotPlot(covid_combined, features = rev(genes.plot), cols = "RdYlBu", group.by = "manual.coarse.idents_factor", dot.scale = 8) + RotatedAxis() + labs(y = "Cell type", x = NULL) + theme(axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15,face = "italic")) + coord_flip()
+saveit(format = "pdf", height = 20, width = 7, name = "b", path = supp_1_path)
+saveit(format = "pdf", height = 20, width = 7)
+```
+
+### ATAC supp 1 ###
+
+```{r}
+atac_supp_path = "~/Figures/Supplement/atac_supp/"
+analysis_dir <- "~" #Set this to the directory with input metadata files
+
+# sample_metadata <- read_csv(glue("{analysis_dir}/sample_metadata.csv"))
+# cell_metadata <- read_csv(glue("{analysis_dir}/cell_metadata.csv"))
+# peak_count_metadata <- read_csv(glue("{analysis_dir}/peak_count_metadata.csv"))
+
+meta.full <- read.csv("~/Desktop/COVID_sc_metadata/AJW_current_COVID_sc_metadata.csv")
+
+cell_metadata <- cell_metadata %>% filter(!is_doublet)
+cell_metadata[cell_metadata$Sample=="ATAC_EV08","current_severity_bin"] <- "0"
+cell_metadata[cell_metadata$Sample=="ATAC_132D0","current_severity_bin"] <- "1-3"
+
+# atac.translate <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/Manuscript/Figures/Fig1/atac.donor.translate.csv") %>% mutate_all(as.character)
+cell_metadata$Sample <- as.character(cell_metadata$Sample)
+cell_metadata$Donor <- mapvalues(cell_metadata$Sample, 
+                                  from = c(atac.translate$atac.label),
+                                  to = c(atac.translate$Donor))
+
+cell_metadata$current_severity.confirm <- mapvalues(cell_metadata$Donor, 
+                                                 from = c(as.character(meta.full$Donor),"EV08"), 
+                                                 to = c(as.character(meta.full$current_severity),"0"))
+
+cell_metadata$acuity <- mapvalues(cell_metadata$Donor, 
+                                                 from = c(as.character(meta.full$Donor),"EV08"), 
+                                                 to = c(as.character(meta.full$acuity),"Healthy"))
+
+cell_metadata$current_severity_bin.confirm <- mapvalues(cell_metadata$current_severity.confirm,
+                                                 from = c("1","2","3","4","5","6","7"), 
+                                                 to = c("1-3","1-3","1-3","4-5","4-5","6-7","6-7"))
+cell_metadata$peak_severity <- mapvalues(cell_metadata$Donor, 
+                                                 from = c(as.character(meta.full$Donor),"EV08"), 
+                                                 to = c(as.character(meta.full$MAX_SEVERITY_SCORE),"0"))
+cell_metadata$peak_severity_bin <- mapvalues(cell_metadata$peak_severity,
+                                                 from = c("1","2","3","4","5","6","7"), 
+                                                 to = c("1-3","1-3","1-3","4-5","4-5","6-7","6-7"))
+cell_metadata$cell_type_broad <- mapvalues(cell_metadata$cell_type, from = names(celltype.fine_to_broad), to = celltype.fine_to_broad)
+
+cell_metadata$acuity <- factor(cell_metadata$acuity, levels = c("Healthy", "Acute"))
+
+cell_metadata$cell.type <- cell_metadata$cell_type_broad
+cell_metadata$cell.type <- mapvalues(cell_metadata$cell.type, 
+                                     from = c("CD14 Monocyte","CD16 Monocyte"), 
+                                     to = c("CD14\nMono","CD16\nMono"))
+propPlot(cell_metadata, each.pt = "Sample", group_by = "current_severity_bin", color_by = "peak_severity_bin") + labs(y = "Proportion of PBMCs (%)")
+saveit(height = 7, width = 12, name = "a", path = atac_supp_path, format = "pdf")
+
+
+cell_metadata$cell.type <- cell_metadata$cell_type
+propPlot(cell_metadata, each.pt = "Sample", group_by = "current_severity_bin", color_by = "peak_severity_bin") + labs(y = "Proportion of PBMCs (%)")
+saveit(height = 12, width = 12, name = "b", path = atac_supp_path, format = "pdf")
+```
+
+### WNN supp ###
+
+```{r}
+supp_2_path = "~/Figures/Supplement/2"
+
+covid_noneuts <- subset(covid_combined, cells = colnames(covid_combined)[-grep("eutrophil", covid_combined$manual.coarse.idents)])
+Idents(covid_noneuts) <- "celltype.l2"
+rna.markers <- FindAllMarkers(covid_noneuts, only.pos = T, assay = "RNA")
+Idents(covid_noneuts) <- "seurat_clusters"
+
+top.genes <- rna.markers %>% group_by(cluster) %>% top_n(5,avg_logFC)
+top.genes$cluster <- factor(top.genes$cluster, levels = sort(unique(covid_noneuts$celltype.l2)))
+top.genes <- top.genes %>% arrange(cluster)
+genes.plot <- unique(top.genes$gene)
+covid_noneuts$celltype.l2_factor <- factor(covid_noneuts$celltype.l2, levels = sort(unique(covid_noneuts$celltype.l2)))
+DotPlot(covid_noneuts, features = c("FOXP3", rev(genes.plot)), cols = "RdYlBu", group.by = "celltype.l2_factor", dot.scale = 8) + RotatedAxis() + labs(y = NULL, x = NULL) + theme(axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15, face = "italic")) + coord_flip()
+saveit(format = "pdf", height = 19, width = 10, name = "a", path = supp_2_path)
+
+Idents(covid_noneuts) <- "celltype.l2"
+protein.markers <- FindAllMarkers(covid_noneuts, assay = "imputed.protein")
+Idents(covid_noneuts) <- "seurat_clusters"
+
+top.genes <- protein.markers %>% group_by(cluster) %>% top_n(10,avg_logFC)
+top.genes$cluster <- factor(top.genes$cluster, levels = sort(unique(covid_noneuts$celltype.l2)))
+top.genes <- top.genes %>% arrange(cluster)
+genes.plot <- unique(top.genes$gene)
+covid_noneuts$celltype.l2_factor <- factor(covid_noneuts$celltype.l2, levels = sort(unique(covid_noneuts$celltype.l2)))
+DotPlot(covid_noneuts, features = rev(genes.plot), cols = "RdYlBu", group.by = "celltype.l2_factor", dot.scale = 8, assay = "imputed.protein") + RotatedAxis() + labs(y = NULL, x = NULL) + theme(axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15)) + coord_flip()
+saveit(format = "pdf", height = 19, width = 10, name = "b", path = supp_2_path)
+```
+
+What is overlap in manual cell type annotation vs. Seurat v4 annotation?
+```{r anno overlap}
+anno.overlap <- dcast(as.data.frame(table(as.character(covid_noneuts$manual.coarse.idents),covid_noneuts$celltype.l2)),formula = Var1~Var2,value.var = "Freq") %>% column_to_rownames(var = "Var1")
+anno.overlap <- 100*anno.overlap/rowSums(anno.overlap)
+pdf(paste0(supp_2_path,"/c.pdf"),height = 3.5, width = 7)
+Heatmap(anno.overlap, name = "% within\nSeurat v4\nannotation", cluster_rows = F, cluster_columns = F, col = colorRamp2(c(0,30,60),c("lightsteelblue","yellow","red")))
+dev.off()
+```
+
+```{r mapping freq}
+# mapping <- read_tsv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/satija_output/full.filtered/azimuth_pred (1).tsv")
+mapping.freq <- aggregate(as.logical(mapping$mapped), by = list(covid_combined$manual.coarse.idents), FUN = mean) %>% arrange(-x)
+mapping.freq$Group.1 <- as.character(mapping.freq$Group.1)
+mapping.freq[mapping.freq$Group.1=="Developing neutrophil","Group.1"] <- "Developing\nNeutrophil"
+mapping.freq[mapping.freq$Group.1=="CD14 Monocyte","Group.1"] <- "CD14\nMonocyte"
+mapping.freq[mapping.freq$Group.1=="CD16 Monocyte","Group.1"] <- "CD16\nMonocyte"
+
+mapping.freq$Group.1 <- factor(mapping.freq$Group.1, levels = as.character(mapping.freq$Group.1))
+
+
+ggplot(mapping.freq, aes_string(y = "x", x = "Group.1")) + 
+  labs(x = NULL, y = "Mapping frequency") + 
+  theme_bw() + theme(panel.grid.minor = element_blank(), 
+                     panel.grid.major = element_blank(), 
+                     strip.background = element_rect(fill = NA, color = NA), 
+                     strip.text = element_text(face = "bold"),
+                     axis.ticks.x = element_blank(), 
+                     axis.text = element_text(color = "black"), 
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) + 
+  guides(fill = FALSE) + 
+  geom_bar(aes_string(fill = "Group.1"), stat = "identity") +
+  theme(panel.grid.major = element_line(color = "grey", size = 0.25)) +
+  scale_fill_igv() + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.1))) + 
+  theme(text = element_text(size=15))
+
+saveit(height = 3, width = 7, format = "pdf", path = supp_2_path, name = "e")
+```
+
+
+```{r mait props}
+# cytof.mait <- read.csv("~/Downloads/covid_MAIT_new.csv")
+# cytof.files <- read.csv("~/Downloads/covid_MAIT_meta.csv")
+colnames(cytof.mait) <- c("file_name","pctT","pctMAITofT")
+
+cytof.mait <- merge(cytof.mait, cytof.files, by = "file_name")
+cytof.mait$pctMAIT <- (cytof.mait$pctMAITofT*cytof.mait$pctT)/100
+
+# pbmc.only.meta <- subset(covid_combined, cells = colnames(covid_combined)[-grep("ACK",colnames(covid_combined))])@meta.data
+fq <- prop.table(table(pbmc.only.meta$celltype.l2, pbmc.only.meta$Donor), 2) *100
+rna.mait <- reshape2::melt(fq, value.name = "freq", varnames = c("celltype.l2", "Donor"))     %>% filter(celltype.l2=="MAIT")
+colnames(rna.mait) <- c("celltype.l2","sample_id","freq")
+cytof.mait <- cytof.mait[cytof.mait$sample_id %in% rna.mait$sample_id,]
+df <- merge(cytof.mait,rna.mait,by = "sample_id")
+severity.merge <- unique(covid_combined@meta.data[,c("Donor",
+                                                     "Severity.max.final",
+                                                     "acuity")])
+colnames(severity.merge) <- c("sample_id", "Severity", "Acuity")
+df <- merge(df,severity.merge,by = "sample_id")
+
+ggplot(df, aes(x=freq,y=pctMAIT,color=Severity,shape=Acuity)) + 
+  geom_point(size=3) + scale_color_manual(values = severity.cols) +
+  geom_smooth(method='lm',aes(group=1),color="grey40") + 
+  stat_regline_equation(mapping = aes(group=1)) + 
+  stat_cor(mapping = aes(group=1), label.y = 3) + 
+  theme_bw() + 
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank(),
+        strip.background = element_rect(fill = NA, color = NA), 
+        strip.text = element_text(face = "bold"), axis.ticks.x = element_blank(), 
+        axis.text = element_text(color = "black"), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        text = element_text(size = 20), aspect.ratio = 1) + 
+  labs(y = "% MAIT CyTOF", x = "% MAIT scRNA")
+saveit(format = "pdf", name = "d",path=supp_2_path, height = 5, width = 7)
+```
+
+### CD8 TEM Supp ###
+```{r cd8 TEM analysis}
+cells.subset <- colnames(covid_combined)[covid_combined$celltype.l2=="CD8 TEM"]
+cells.subset <- cells.subset[!cells.subset %in% colnames(covid_combined)[grep("eutrophil",covid_combined$manual.coarse.idents)]]
+cd8TEM.seu <- subset(covid_combined, cells = cells.subset)
+cd8TEM.seu <- RunPCA(cd8TEM.seu, verbose = F)
+cd8TEM.seu <- RunUMAP(cd8TEM.seu, verbose = F, dims = 1:50)
+cd8TEM.seu <- FindNeighbors(cd8TEM.seu, verbose = F, dims = 1:50)
+cd8TEM.seu <- FindClusters(cd8TEM.seu, verbose = F)
+
+exh.list <- read.csv(url("https://raw.githubusercontent.com/ajwilk/2020_Wilk_COVID/master/code/exh.list.csv"))
+exh.genes <- nichenetr::convert_mouse_to_human_symbols(as.character(exh.list$gene))
+cd8TEM.seu <- AddModuleScore(cd8TEM.seu, features = list(as.character(exh.genes)), name = "Texh", nbin = 10)
+
+
+cells.keep <- colnames(covid_combined)[grep("CD8",(covid_combined$celltype.l2))]
+allcd8.seu <- subset(covid_combined, cells = cells.keep)
+allcd8.seu <- RunPCA(allcd8.seu, verbose = F)
+allcd8.seu <- RunUMAP(allcd8.seu, verbose = F, dims = 1:50)
+allcd8.seu <- AddModuleScore(allcd8.seu, features = list(as.character(exh.genes)), name = "Texh", nbin = 10)
+
+#panel g
+p1 <- DimPlot(allcd8.seu,group.by = "Severity.max.final", cols=severity.cols, reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+
+p2 <- DimPlot(allcd8.seu,group.by = "celltype.l2", label = T, repel = T, reduction = "umap", label.size = 10) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend() + scale_color_igv() + theme(text = element_text(face = "bold")) + theme(axis.title.x = element_text(face = "plain"), axis.title.y = element_text(face = "plain"))
+
+CombinePlots(list(p1,p2),ncol=2)
+saveit(name = "g", path = wnn_fig_path, height = 5, width = 10)
+
+
+#panel h
+allcd8.seu$celltype.l2.factor <- factor(allcd8.seu$celltype.l2, levels = rev(c("CD8 Naive","CD8 TCM","CD8 TEM")))
+DotPlot(allcd8.seu, features = (c("SELL","CCR7","CD27","CD28","CD44","PRF1","GZMB","CX3CR1","IFNG")), group.by = "celltype.l2.factor", scale.max = 20, cols = "RdYlBu", dot.scale = 10, assay = "RNA") + labs(x=NULL,y=NULL) + RotatedAxis() + theme(axis.text.x = element_text(size = 15, face = "italic"), axis.text.y = element_text(size=15))
+saveit(format = "pdf", name = "h", path = wnn_fig_path, height = 4, width = 10)
+
+#panel i
+FeatureBoxPlot(cd8TEM.seu, features = c("GZMB","PRF1","CX3CR1","OGT"), ncol = 4) + NoLegend()
+saveit(name = "i", path = wnn_fig_path, height = 7, width = 12, format = "pdf")
+
+#panel j
+allcd8.seu$cell.type <- allcd8.seu$celltype.l2
+FeatureBoxPlot(allcd8.seu, by = "cell.type", features = "Texh1", ncol = 5, facet.face = "bold") + labs(y = "Mean exhaustion score") + NoLegend()
+saveit(width = 14*(3/5), height = 7, format = "pdf", name = "j", path = wnn_fig_path)
+```
+
+Ablation of OGT leads to T cell apoptosis: https://www.nature.com/articles/s41467-019-08300-3 and https://mcb.asm.org/content/24/4/1680
+On TEM, CX3CR1 defines cells with heightened effector functions. https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5931117/ and https://www.cell.com/immunity/pdfExtended/S1074-7613(16)30429-0
+
+
+### Monocyte supplemental figure ###
+```{r}
+mono_supp_fig_path = "~/Figures/Supplement/mono_supp/"
+p <- DimPlot(covid_CD14mono,group.by = "Donor", cols=severity.cols, pt.size = 0) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) + scale_color_igv()
+p$layers[[1]]$aes_params$alpha = .75
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "a",path = mono_supp_fig_path,width = 7, height = 7)
+
+hla.genes <- grep("^HLA-D",rownames(covid_combined),value=T)
+covid_CD14mono <- AddModuleScore(covid_CD14mono, features = list(hla.genes),name = "hla")
+FeatureBoxPlot(covid_CD14mono, features = "hla1") + labs(y="Mean module score") + theme(strip.text = element_text(size = 0))
+saveit(name = "b",path = mono_supp_fig_path,width = 7, height = 5) 
+
+Idents(covid_combined) <- "manual.coarse.idents"
+covid_CD16mono <- subset(covid_combined, idents = "CD16 Monocyte")
+Idents(covid_combined) <- "seurat_clusters"
+covid_CD16mono <- RunPCA(covid_CD16mono, verbose = F)
+covid_CD16mono <- RunUMAP(covid_CD16mono, verbose = F, dims = 1:50)
+covid_CD16mono <- FindNeighbors(covid_CD16mono)
+covid_CD16mono <- FindClusters(covid_CD16mono)
+
+p <- DimPlot(covid_CD16mono,group.by = "Severity.max.final", cols=severity.cols, reduction = "umap", pt.size = 1) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) 
+p$layers[[1]]$aes_params$alpha = .75
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "c",path = mono_supp_fig_path,width = 7, height = 7)
+
+
+myFeaturePlot(covid_CD16mono, features = c("IFI27","IFITM3","CD163", "ARG1", "PLAC8", "MPO", "HLA-DRA", "CD4", "IL1B", "IL6", "CCL3", "TNF"), ncol = 6, height = 8, width = 21)
+
+
+FeatureBoxPlot(covid_CD16mono, features = c("IFI27","IFITM3","CD163", "ARG1", "PLAC8", "MPO", "HLA-DRA", "CD4", "IL1B", "IL6", "CCL3", "TNF"), ncol = 6) + theme(aspect.ratio = 1, text = element_text(size = 25))
+saveit(height = 8, width = 25, format = "pdf", name = "d", path = mono_supp_fig_path)
+
+p1 <- FeatureBoxPlot(covid_CD14mono, features = "IFN1") + NoLegend() + labs(y = "Mean module score") + theme(strip.text = element_text(size = 0))
+p2 <- FeatureBoxPlot(covid_CD16mono, features = "IFN1") + NoLegend() + labs(y = "Mean module score") + theme(strip.text = element_text(size = 0))
+CombinePlots(list(p1,p2))
+saveit(height = 5, width = 10, format = "pdf", name = "e", path = mono_supp_fig_path)
+
+```
+
+### Monocyte ATAC supp ###
+```{r NFKB DotPlot}
+mono_atac_supp_path = "~/Figures/Supplement/mono_atac/"
+
+DotPlot(covid_CD14mono, features = c("NFKB1","NFKB2","REL","RELA","RELB"), group.by = "Severity.current.final", cols = "RdYlBu", dot.scale = 15) + 
+  rotate_x_text() + 
+  theme(axis.text.x = element_text(face = "italic",size=15),
+        axis.text.y = element_text(size = 15),
+        axis.title.y = element_text(size = 15)) + 
+  labs(x = NULL, y = "Severity score at draw")
+saveit(name = "a", format = "pdf", path = mono_atac_supp_path, height = 4, width = 6)
+
+FeatureBoxPlot(covid_CD14mono, features = c("NFKB1","NFKB2","REL","RELA","RELB"), ncol = 3)
+saveit(height = 6, width = 9, name = "b", format = "pdf", path = mono_atac_supp_path)
+```
+
+### Mono stroke supp ###
+
+```{r}
+mono_supp_stroke_path = "~/Figures/Supplement/mono_stroke/"
+
+Idents(covid_combined) <- "manual.coarse.idents"
+DotPlot(covid_combined, features = c("C19orf59","IRAK3","ANXA3","RBM47","TLR5"), cols = "RdYlBu", dot.scale = 10) + rotate_x_text() + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face="italic"))
+Idents(covid_combined) <- "seurat_clusters"
+saveit(name = "a", format = "pdf", path = mono_supp_stroke_path, height = 5, width = 6)
+
+
+myFeaturePlot(covid_combined, features = c("C19orf59","IRAK3","ANXA3"), ncol = 1, height = 10, width = 5)
+
+FeatureBoxPlot.stroke(covid_combined, features = c("C19orf59"))
+
+
+FeatureBoxPlot.stroke(covid_CD14mono, features = c("C19orf59","IRAK3","ANXA3","RBM47","TLR5"),ncol = 5)
+saveit(name = "c", format = "pdf", path = mono_supp_stroke_path, height = 6, width = 18)
+
+FeatureBoxPlot.stroke(neut_alone, features = c("C19orf59","IRAK3","ANXA3","RBM47","TLR5"),ncol=5)
+saveit(name = "d", format = "pdf", path = mono_supp_stroke_path, height = 6, width = 18)
+```
+
+
+### Consensus supp ###
+```{r ISG boxplots}
+consensus_supp_fig_path = "~/Figures/Supplement/consensus_supp/"
+covid_combined$cell.type <- covid_combined$manual.coarse.idents
+covid_combined$cell.type <- as.character(covid_combined$cell.type)
+covid_combined$cell.type[covid_combined$cell.type=="Developing neutrophil"] <- "Developing\nneutrophil"
+covid_combined$cell.type[covid_combined$cell.type=="CD16 Monocyte"] <- "CD16 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="CD14 Monocyte"] <- "CD14 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="Eos/Mast Prog"] <- "Eos/Mast\nProg"
+FeatureBoxPlot(covid_combined, features = "IFN1", by = "cell.type", ncol = 7) + theme(legend.position = "bottom", legend.box = "vertical", strip.text = element_text(face = "bold")) + labs(y = "Mean ISG module score")
+saveit(height = 10, width = 20, name = "a", format = "pdf", path = consensus_supp_fig_path)
+```
+
+
+```{r heatmaps}
+#correct for number of donors
+# marker.lists <- list(NK.markers, CD4T.markers, neut.markers, CD8T.markers, CD14mono.markers, CD16mono.markers, B.markers, DC.markers)
+lapply(marker.lists, FUN = function(x) {ncol(x[,-grep("^H",colnames(x))])})
+
+
+covid_neut.idents <- c("5", "8", "9", "15", "21", "28")
+covid_CD14mono.idents <- c("1", "4", "11")
+covid_CD16mono.idents <- "16"
+covid_DC.idents <- c("27", "30")
+covid_B.idents <- "3"
+
+covid_compartments <- list(covid_neut.idents, covid_B.idents, covid_CD14mono.idents, covid_CD16mono.idents, covid_DC.idents)
+covid_compartments.names <- c("Neutrophil", "B", "CD14 monocyte", "CD16 monocyte", "DC")
+seu.meta <- covid_combined@meta.data
+seu.meta <- seu.meta[grep("^C", (seu.meta$Donor.full)),]
+#donors only considered in differential tests if at least 50 cells in the compartment
+ndonors <- lapply(covid_compartments, FUN = function(x) {
+  meta.filtered <- seu.meta[seu.meta$seurat_clusters %in% x,]
+  length(names(table(meta.filtered$Donor.full))[table(meta.filtered$Donor.full)>49])
+})
+
+covid_CD4T.cells <- colnames(covid_combined)[grep("^CD4",covid_combined$celltype.l3)]
+covid_CD8T.cells <- colnames(covid_combined)[grep("^CD8",covid_combined$celltype.l3)]
+covid_NK.cells <- colnames(covid_combined)[grep("^NK",covid_combined$celltype.l3)]
+covid_CD4T.cells <- covid_CD4T.cells[!covid_CD4T.cells %in% colnames(covid_combined)[grep("eutrophil$",covid_combined$manual.coarse.idents)]]
+covid_CD8T.cells <- covid_CD8T.cells[!covid_CD8T.cells %in% colnames(covid_combined)[grep("eutrophil$",covid_combined$manual.coarse.idents)]]
+covid_NK.cells <- covid_NK.cells[!covid_NK.cells %in% colnames(covid_combined)[grep("eutrophil$",covid_combined$manual.coarse.idents)]]
+
+covid_compartments <- list(covid_CD4T.cells, covid_CD8T.cells, covid_NK.cells)
+covid_compartments.names.T <- c("CD4 T", "CD8 T", "NK")
+
+seu.meta <- covid_combined@meta.data
+seu.meta <- seu.meta[grep("^C", (seu.meta$Donor.full)),]
+ndonors.T <- lapply(covid_compartments, FUN = function(x) {
+  meta.filtered <- seu.meta[seu.meta$cell.name %in% x,]
+  length(names(table(meta.filtered$Donor.full))[table(meta.filtered$Donor.full)>49])
+})
+
+ndonor.results <- data.frame(celltype = c(covid_compartments.names, covid_compartments.names.T),
+                             ndonor = c(unlist(ndonors),unlist(ndonors.T)))
+ndonor.results <- ndonor.results[match(colnames(ISG.markers.m),ndonor.results$celltype),]
+
+# ISG.markers.m.corrected <- ISG.markers.m
+for (i in 1:ncol(ISG.markers.m.corrected)) {
+  ISG.markers.m.corrected[,i] <- 100*(ISG.markers.m.corrected[,i]/ndonor.results[i,2])
+}
+
+
+pdf(paste0(consensus_supp_fig_path,"b.pdf"), height = 4, width = 12)
+Heatmap(t(ISG.markers.m.corrected), name = "% of COVID-19\nsamples", border = T, 
+        col = colorRamp2(c(0,100), c("white","green4")),
+        column_names_gp = gpar(fontface="italic"))
+dev.off()
+
+ndonor.results <- ndonor.results[match(colnames(cytokine.markers.m),ndonor.results$celltype),]
+# cytokine.markers.m.corrected <- cytokine.markers.m
+for (i in 1:ncol(cytokine.markers.m.corrected)) {
+  cytokine.markers.m.corrected[,i] <- 100*(cytokine.markers.m.corrected[,i]/ndonor.results[i,2])
+}
+
+pdf(paste0(consensus_supp_fig_path,"c.pdf"), height = 4, width = 4)
+Heatmap((cytokine.markers.m.corrected), name = "% of COVID-19\nsamples", border = T, 
+        col = colorRamp2(c(0,100), c("white","green4")),
+        row_names_gp = gpar(fontface="italic")
+        )
+dev.off()
+```
+
+### Array type supp ###
+
+```{r}
+array_supp_fig_path = "~/Figures/Supplement/array/"
+
+p <- DimPlot(covid_combined,group.by = "Array.type", cols=c("steelblue","red2"), reduction = "umap", pt.size = 0) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) 
+p$layers[[1]]$aes_params$alpha = .3
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "a",path = array_supp_fig_path,width = 7, height = 7)
+
+covid_combined$cell.type <- covid_combined$manual.coarse.idents
+covid_combined$cell.type <- as.character(covid_combined$cell.type)
+covid_combined$cell.type[covid_combined$cell.type=="Developing neutrophil"] <- "Developing\nneutrophil"
+covid_combined$cell.type[covid_combined$cell.type=="CD16 Monocyte"] <- "CD16 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="CD14 Monocyte"] <- "CD14 Mono"
+covid_combined$cell.type[covid_combined$cell.type=="Eos/Mast Prog"] <- "Eos/Mast\nProg"
+covid.seuAbundances(covid_combined, by = "cell.type", group_by = "Array.type", 
+                    meta.include = c("Severity.max.final", "Donor.coarse", "record_id", "acuity", "orig.ident", "Array.type", "Donor", "Donor.full"), 
+                    color_by = "Severity.max.final", 
+                    custom_fill_colors = severity.cols,
+                    group_by.point = "Donor", 
+                    each.pt = "orig.ident",
+                    correct = F, 
+                    comparisons = my_comparisons.current,
+                    select.idents = c("CD4 T",
+                                      "CD8 T",
+                                      "NK",
+                                      "Prolif Lymph",
+                                      "B",
+                                      "PB",
+                                      "CD14 Mono",
+                                      "CD16 Mono",
+                                      "DC",
+                                      "pDC",
+                                      "Eos/Mast\nProg",
+                                      "Platelet",
+                                      "Developing\nneutrophil",
+                                      "Neutrophil"),
+                    label.x = 1, pt.size = 3, ncol = 3) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.075))) + 
+  labs(color = "Severity\nscore", x = "Cell type input") + 
+  theme(text = element_text(size = 20), aspect.ratio = 1) + theme(legend.position = c(0.85,0.05))
+saveit(height =14,width=10, name = "c",path = array_supp_fig_path, format = "pdf")
+
+p <- DimPlot(covid_combined,group.by = "Donor", cols=severity.cols, pt.size = 0, reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) + scale_color_igv()
+p$layers[[1]]$aes_params$alpha = .3
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "b",path = array_supp_fig_path,width = 14, height = 7)
+```
+
+### Neutrophil pilot supp ###
+Figure S3a
+```{r UMAP}
+# neut_combined <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/201130--neut_combined.seu.rds")
+neut_combined <- NormalizeData(neut_combined, assay = "RNA")
+
+supp_3_path = "~/Figures/Supplement/3"
+
+neut_combined$cell.type.coarse <- mapvalues(neut_combined$cell.type.coarse, from = "Unknown", to = "HSPC")
+cell.types <- data.frame(cell.type.coarse = neut_combined$cell.type.coarse, array = neut_combined$array)
+level.order <- c("PBMC","Isolated\nNeutrophils", "ACK-lysed\nwhole blood")
+cell.types <- cell.types[order(match(cell.types$array, level.order)),]
+
+p <- DimPlot(neut_combined, group.by = "array", order = "ACK-lysed\nwholeblood", cols=c("steelblue","yellow4","red"))
+p$data$cell.type.coarse <- cell.types$cell.type.coarse
+p <- LabelClusters(p, id = "cell.type.coarse", size = 7, fontface = "bold")
+p$layers[[1]]$aes_params$alpha = .5
+p + guides(colour = guide_legend(keywidth = 0.7,
+                                 keyheight = 0.7,
+                                 default.unit = "inch",
+                                 override.aes = list(alpha = 1,size=5))) + 
+  labs(x = "UMAP1", y = "UMAP2") + 
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), 
+        axis.text.x = element_blank(), axis.ticks.x = element_blank()) + 
+  theme(legend.text = element_text(size = 20), aspect.ratio = 1)
+saveit(name = "a", path = supp_3_path, height = 7, width = 9)
+```
+Figure S3b
+```{r gene and UMI}
+neut_combined$compartment <- ifelse(neut_combined$cell.type.coarse=="Neutrophil", "Granulocyte", "PBMC")
+neut_combined@meta.data[neut_combined$cell.type.coarse=="Eosinophil","compartment"] <- "Granulocyte"
+
+DimPlot(neut_combined, group.by = "compartment")
+
+VlnPlot(neut_combined, features = c("nCount_RNA"), group.by = "compartment",pt.size = 0)
+
+ggboxplot(data = neut_combined@meta.data, 
+          x = "compartment", 
+          y = "nCount_RNA",
+          color = "compartment",
+          add = "jitter",
+          #yscale = "sqrt",
+          outlier.shape = NA,
+          ylab = "nUMI",
+          xlab = NULL,
+          legend = "none")
+
+ggboxplot(data = neut_combined@meta.data, 
+          x = "compartment", 
+          y = "nFeature_RNA",
+          color = "compartment",
+          add = "jitter",
+          #yscale = "log10",
+          outlier.shape = NA,
+          ylab = "nGene",
+          xlab = NULL,
+          legend = "none")
+```
+
+Figure S3c
+```{r bar chart}
+fq <- prop.table(table(neut_combined$cell.type.coarse, neut_combined$orig.ident), 2) *100
+neut.prop <- reshape2::melt(fq, value.name = "freq", varnames = c("cell.type", "orig.ident"))
+custom_fill_colors = c("steelblue","red","yellow4","yellow4")
+neut.prop$orig.ident <- mapvalues(neut.prop$orig.ident, from = c("CPTNeut","WBNeut","ACK"), to = c("Isol. neut\n(CPT pellet)","Isol. neut\n(WB)","ACK-lysed\nWB"))
+neut.prop$orig.ident <- factor(neut.prop$orig.ident, levels = c("PBMC",
+                                                                "ACK-lysed\nWB",
+                                                                "Isol. neut\n(WB)",
+                                                                "Isol. neut\n(CPT pellet)"))
+ggplot(neut.prop, aes_string(y = "freq", x = "orig.ident")) + 
+  labs(x = NULL, y = "Proportion (%)") + 
+  theme_bw() + theme(panel.grid.minor = element_blank(), 
+                     panel.grid.major = element_blank(), 
+                     strip.background = element_rect(fill = NA, color = NA), 
+                     strip.text = element_text(face = "bold"),
+                     axis.ticks.x = element_blank(), 
+                     axis.text = element_text(color = "black"), 
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) + 
+  facet_wrap("cell.type", scales = "free_y", ncol = 3) + 
+  guides(fill = FALSE) + 
+  geom_bar(aes_string(fill = "orig.ident"), stat = "identity") +
+  theme(panel.grid.major = element_line(color = "grey", size = 0.25), aspect.ratio = 0.5) +
+  scale_fill_manual(values = custom_fill_colors) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.1)))
+
+saveit(name = "c", path = supp_3_path, height = 6, width = 6, format = "pdf")
+```
+
+Figure S3d-e
+```{r dotPlots}
+neut.markers <- FindMarkers(neut_combined, ident.1 = "Neutrophil", group.by = "cell.type.coarse", assay = "RNA")
+top.genes <- neut.markers %>% top_n(15,(avg_logFC))
+neut_combined.alone <- subset(neut_combined, cells = colnames(neut_combined)[neut_combined$cell.type.coarse=="Neutrophil"])
+neut_combined.alone <- subset(neut_combined.alone, cells = colnames(neut_combined.alone)[!neut_combined.alone$orig.ident=="PBMC"])
+neut_combined.alone$orig.ident <- mapvalues(neut_combined.alone$orig.ident, from = c("CPTNeut","WBNeut","ACK"), to = c("Isol. neut\n(CPT pellet)","Isol. neut\n(WB)","ACK-lysed\nWB"))
+
+DotPlot(neut_combined.alone, features = rownames(top.genes), cols = "RdYlBu", group.by = "orig.ident", dot.scale = 8, scale = F, assay = "RNA") + RotatedAxis() + labs(y = NULL, x = NULL) + theme(axis.text.x = element_text(size = 15, face = "italic"), axis.text.y = element_text(size = 15))
+saveit(format = "pdf", height = 5, width = 8, name = "d", path = supp_3_path)
+Idents(neut_combined) <- "cell.type.coarse"
+neut_combined.markers <- FindAllMarkers(neut_combined, only.pos = T, assay = "RNA")
+Idents(neut_combined) <- "seurat_clusters"
+
+top.genes <- neut_combined.markers %>% group_by(cluster) %>% top_n(5,avg_logFC)
+top.genes$cluster <- factor(top.genes$cluster, levels = sort(unique(neut_combined$cell.type.coarse)))
+top.genes <- top.genes %>% arrange(cluster)
+genes.plot <- unique(top.genes$gene)
+
+neut_ACK.PBMC <- subset(neut_combined, cells = colnames(neut_combined)[neut_combined$array=="PBMC" | neut_combined$orig.ident=="ACK"])
+neut_ACK.PBMC$cell.type.coarse_factor <- factor(neut_ACK.PBMC$cell.type.coarse, levels = sort(unique(neut_ACK.PBMC$cell.type.coarse)))
+DotPlot(neut_ACK.PBMC, features = rev(genes.plot), cols = "RdYlBu", group.by = "cell.type.coarse_factor", dot.scale = 8, split.by = "orig.ident", assay = "RNA") + RotatedAxis() + labs(y = NULL, x = NULL) + theme(axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15, face = "italic")) + coord_flip() + theme(legend.position = "top")
+saveit(format = "pdf", height = 15, width = 9, name = "e", path = supp_3_path)
+```
+
+
+### DevNeut Supp ###
+
+```{r}
+devneut_supp_fig_path = "~/Figures/Supplement/devneut/"
+data_run <- t(GetAssayData(devneut_alone.nc2, assay = "SCT", slot = "scale.data"))
+data_phate <- phate(data_run, ndim=3)
+
+devneut_alone.nc2[["phate3d"]] <- CreateDimReducObject(embeddings = data_phate$embedding, key = "PHATE_")
+
+plot.data <- FetchData(object = devneut_alone.nc2, vars = c("phate3d_1", "phate3d_2", "phate3d_3", "latent_time"))
+
+#panel A
+plot_ly(data = plot.data, 
+        x = ~phate3d_1, y = ~phate3d_2, z = ~phate3d_3, 
+        color = ~latent_time, 
+        colors = c("blue","yellow","red"),
+        type = "scatter3d", 
+        mode = "markers", 
+        marker = list(size = 5, width=2))
+
+
+t <- devneut_alone.nc2$latent_time
+plot_traj_genes(seu=devneut_alone.nc2, genes = c("FUT4","CD101","CD63","ITGAM")) + theme(text = element_text(size = 20),aspect.ratio = 1)
+saveit(width = 5.5, height = 4.5,name = "c",path = devneut_supp_fig_path,format="pdf")
+
+plot_traj_genes(genes = c("CEBPB", "TBP","OTX2","ZNF146"), seu = devneut_alone.nc2)  + theme(text = element_text(size = 20),aspect.ratio = 1)
+saveit(width = 5.5, height = 4.5,name = "d",path = devneut_supp_fig_path,format="pdf")
+
+df <- devneut_alone.nc2@meta.data[,c("Donor","latent_time","Severity.max.final")]
+df.final <- df[df$Donor %in% names(table(df$Donor))[table(df$Donor)>60],]
+df.final <- df.final[!df.final$Donor=="HIP015",]
+ggplot(df.final) +
+  geom_density(aes(x = latent_time, y = ..scaled.., group = Donor, 
+                   color = Severity.max.final, fill = Severity.max.final), alpha = 0.1) +
+  scale_color_manual(values = severity.cols[2:5]) + 
+  scale_fill_manual(values = severity.cols[2:5]) + 
+  ylab(paste("Relative density (scaled)")) + xlab("Latent time") + theme_bw() + 
+  theme(panel.grid.minor = element_blank(), 
+        panel.grid.major = element_blank(), 
+        strip.background = element_rect(fill = NA, color = NA), 
+        strip.text = element_text(face = "bold"),
+        axis.ticks.x = element_blank(), 
+        axis.text = element_text(color = "black"), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) + 
+  labs(fill = "Severity\nScore") + 
+  guides(color=F, fill = guide_legend(override.aes = list(alpha = 1))) + theme(text = element_text(size = 20),aspect.ratio = 1)
+saveit(format = "pdf", width = 5.5, height = 4, name = "b", path = devneut_supp_fig_path)
+```
+
+
+```{r}
+covid_pbn.cells <- c(colnames(covid_combined)[grep("eutrophil",
+                                                   covid_combined$manual.coarse.idents)],
+                     colnames(covid_combined)[grep("PB$",
+                                                   covid_combined$manual.coarse.idents)],
+                     colnames(covid_combined)[covid_combined$seurat_clusters==covid_B.idents])
+
+covid_pbn <- subset(covid_combined, cells = covid_pbn.cells)
+covid_pbn <- RunPCA(covid_pbn, verbose = F)
+covid_pbn <- RunUMAP(covid_pbn, dims = 1:50, verbose = F)
+covid_pbn <- FindNeighbors(covid_pbn, verbose = F)
+covid_pbn <- FindClusters(covid_pbn, verbose = F)
+
+DimPlot(covid_pbn, reduction = "umap") + NoLegend()
+DimPlot(covid_pbn, label = T, repel = T, group.by = "manual.coarse.idents", reduction = "umap") + NoLegend()
+textme()
+
+writeAnnData(emat = covid_combined.emat,
+             nmat = covid_combined.nmat, 
+             seu = covid_pbn, 
+             obs.vars = c("orig.ident","seurat_clusters","manual.coarse.idents",
+                          "manual.fine.idents","Severity.max.final"),
+             name = "covid_pbn",
+             dir = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/adata_export/covid_pbn/")
+```
+
+```{r mortality prediction devneut}
+public <- read_tsv(url("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE157103&format=file&file=GSE157103%5Fgenes%2Etpm%2Etsv%2Egz"))
+public <- as.matrix(public%>%column_to_rownames(var = "#symbol"))
+public <- public[,-grep("^N",colnames(public))]
+test <- CreateSeuratObject((public))
+markers.use <- c("DEFA1B","DEFA3","LTF","DEFA1","S100A8")
+
+test <- AddModuleScore(test,
+                       features=list(markers.use),
+                                          name = "test")
+
+
+classification <- read.xlsx("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/death_pred/fatal_cases_complete.xlsx")
+
+classification <- classification[classification$fatal==1,]
+
+test$fatal <- ifelse(rownames(test@meta.data) %in% classification$record_id,1,0)
+pdf(file="~/Downloads/p.pdf",width =3.5,height=3.5)
+roc(test$fatal,test$test1,plot=T,legacy.axes=T,col="steelblue",lwd=4,asp=NA,print.auc=TRUE, 
+    #print.auc.x=45, partial.auc=c(100, 90), 
+    auc.polygon = TRUE, auc.polygon.col = "#377eb822")
+dev.off()
+
+
+df <- test@meta.data[,c("fatal","test1")] %>% rownames_to_column(var = "donor") %>% arrange(test1)
+df$donor <- factor(df$donor, levels = as.character(df$donor))
+df$Mortality <- mapvalues(df$fatal, from = c(0,1), to = c("Non-fatal","Fatal"))
+ggplot(df, aes_string(y = "test1", x = "donor", fill = "Mortality")) + 
+  labs(x = "COVID-19 samples", y = "Developing neutrophil gene score") + 
+  theme_bw() + theme(panel.grid.minor = element_blank(), 
+                     panel.grid.major = element_blank(), 
+                     strip.background = element_rect(fill = NA, color = NA), 
+                     strip.text = element_text(face = "bold"),
+                     axis.ticks.x = element_blank(), 
+                     axis.text = element_text(color = "black"), 
+                     axis.text.x = element_blank(),
+                     panel.grid.major.x = element_blank(),
+                     panel.grid.major.y = element_blank(),
+                     aspect.ratio = 1) + 
+  # guides(fill = FALSE) + 
+  geom_bar(aes_string(fill = "Mortality"), stat = "identity") +
+  theme(panel.grid.major = element_line(color = "grey", size = 0.25)) +
+  scale_fill_manual(values = c("Non-fatal" = "grey80", "Fatal" = "black")) + 
+  scale_y_continuous(expand = expand_scale(mult = c(0.05, 0.1))) + 
+  theme(text = element_text(size=15))
+saveit(height = 5, width = 6, name = "g", path = devneut_supp_fig_path, format = "pdf")
+```
+
+
+### Convalescent Supp ###
+
+```{r upset conv DEG}
+conv_supp_fig_path = "~/Figures/Supplement/conv_supp/"
+
+pbmc.only <- update.metadata(pbmc.only)
+mild.degs <- FindMarkers(pbmc.only, ident.1 = "1-3", ident.2 = "0", group.by = "severity_conv", assay = "RNA")
+mild.degs.lr <- FindMarkers(pbmc.only, ident.1 = "1-3", ident.2 = "0", group.by = "severity_conv", assay = "RNA", latent.vars = "Donor",test.use = "LR")
+
+moderate.degs <- FindMarkers(pbmc.only, ident.1 = "4-5", ident.2 = "0", group.by = "severity_conv", assay = "RNA")
+severe.degs <- FindMarkers(pbmc.only, ident.1 = "6-7", ident.2 = "0", group.by = "severity_conv", assay = "RNA")
+conv.degs <- FindMarkers(pbmc.only, ident.1 = "Convalescent", ident.2 = "0", group.by = "severity_conv", assay = "RNA")
+
+p.cutoff = 1e-5
+mild.degs.f <- mild.degs %>% rownames_to_column(var = "gene") %>% filter_quality() %>% filter(p_val_adj<p.cutoff) 
+moderate.degs.f <- moderate.degs %>% rownames_to_column(var = "gene") %>% filter_quality() %>% filter(p_val_adj<p.cutoff) 
+severe.degs.f <- severe.degs %>% rownames_to_column(var = "gene") %>% filter_quality() %>% filter(p_val_adj<p.cutoff) 
+conv.degs.f <- conv.degs %>% rownames_to_column(var = "gene") %>% filter_quality() %>% filter(p_val_adj<p.cutoff) 
+
+degs.c <- rbind(data.frame(gene = mild.degs.f$gene,
+                     comp = "Mild",
+                     count = 1),
+                data.frame(gene = moderate.degs.f$gene,
+                     comp = "Moderate",
+                     count = 1),
+                data.frame(gene = severe.degs.f$gene,
+                     comp = "Severe",
+                     count = 1),
+                data.frame(gene = conv.degs.f$gene,
+                     comp = "Convalescent",
+                     count = 1))
+
+degs.m <- dcast(degs.c, formula = gene~comp, value.var = "count")
+
+pdf("~/Figures/Supplement/conv_supp/upset.pdf", width =6, height = 3)
+ComplexUpset::upset(degs.m,c("Mild","Moderate","Severe","Convalescent"),
+                    name = "Sample group",
+                    base_annotations = list(
+                      'Intersection size'=intersection_size(counts=F)
+                    )) #& scale_fill_manual(values=severity.cols)
+dev.off()
+```
+
+
+```{r mild perturb}
+# rna.marker.list_mild <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/rna.marker.list.wilcoxon_convalescent_mild.rds")
+
+ig.genes <- c(grep("^IGH",rownames(covid_mild),value = T),
+              grep("^IGK",rownames(covid_mild),value = T),
+              grep("^IGL",rownames(covid_mild),value = T),
+              "IGJ")
+
+rna.marker.list_mild <- lapply(rna.marker.list_mild, function(x) {
+  try(x <- x[x$gene %notin% ig.genes,])
+  return(x)
+})
+# perturb.score <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/perturb.score.filter_quality_convalescent_mildwISG.rds")
+perturb.score.m <- Reduce(cbind,perturb.score )
+colnames(perturb.score.m) <- names( perturb.score  )
+rownames(perturb.score.m) <- mapvalues(rownames(perturb.score.m), from = as.character(rna.meta$Donor), to = as.character(rna.meta$Donor.full))
+
+anno <- unique(row_annotation[row_annotation$Donor.full %in% rownames(perturb.score.m),])
+anno <- anno[match(rownames(perturb.score.m),anno$Donor.full),]
+ta = columnAnnotation(Acuity = anno$acuity,
+                      "Severity at draw" = anno$Severity.final.current,
+                      col = list(Acuity = c("Acute" = "orange",
+                                                 "Convalescent" = "purple"),
+                                 "Severity at draw" = c("0" = severity.cols[1],
+                                                        "1-3" = severity.cols[2])))
+pdf(paste0(conv_supp_fig_path,"a.pdf"), height = 5, width = 7)
+Heatmap(t(abs(perturb.score.m)), 
+        top_annotation = ta,
+        col = colorRamp2(breaks = c(0,6,12), colors = c("black","purple","yellow")),
+        name = "Perturbation\nscore",
+        column_names_gp = gpar(fontsize=0))
+dev.off()
+# rna.marker.list_mild <- rna.marker.list
+```
+
+```{r panel convc}
+covid_mild <- RunPCA(covid_mild)
+covid_mild <- RunUMAP(covid_mild, dims = 1:50)
+
+#panel c --> must plot legend separately
+p <- DimPlot(covid_mild,group.by = "acuity", cols=c("orange","purple"), reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1)  + theme(legend.position = c(.6,.2))
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "b", path = conv_supp_fig_path, height = 5, width = 5)
+
+#panel d
+p <- DimPlot(covid_mild,group.by = "celltype.l2", reduction = "umap", label = T, repel = T, label.size = 4) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + scale_color_igv()
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+saveit(path = conv_supp_fig_path, name = "b2", height = 5, width = 5)
+```
+
+```{r panel convd}
+cd8tem.mild.seu <- subset(cd8TEM.seu, cells = intersect(colnames(cd8TEM.seu),colnames(covid_mild)))
+
+features.plot <- c((rna.marker.list_mild[["CD8 TEM"]] %>% filter(abs(avg_logFC)>1))$gene,
+                   (rna.marker.list_mild[["CD8 TEM"]] %>% filter(abs(avg_logFC)<(-1)))$gene)
+DotPlot(cd8tem.mild.seu, features = features.plot, group.by = "acuity", cols = "RdYlBu", assay = "RNA", scale = F, dot.scale = 10) + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face = "italic")) + rotate_x_text()
+saveit(name = "c", path = conv_supp_fig_path, width = 4.5, height = 3.5, format = "pdf")
+
+cd14mono.mild.seu <- subset(covid_CD14mono, cells = intersect(colnames(covid_CD14mono),colnames(covid_mild)))
+
+features.plot <- c((rna.marker.list_mild[["CD14 Mono"]] %>% filter(abs(avg_logFC)>1))$gene,
+                   (rna.marker.list_mild[["CD14 Mono"]] %>% filter(abs(avg_logFC)<(-1)))$gene)
+DotPlot(cd14mono.mild.seu, features = features.plot, group.by = "acuity", cols = "RdYlBu", assay = "RNA", scale = F, dot.scale = 10) + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face = "italic")) + rotate_x_text()
+saveit(name = "d", path = conv_supp_fig_path, width = 6, height = 3.5, format = "pdf")
+```
+
+
+```{r perturb moderate}
+# rna.marker.list_moderate <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/rna.marker.list.wilcoxon_convalescent_moderate.rds")
+
+ig.genes <- c(grep("^IGH",rownames(covid_moderate),value = T),
+              grep("^IGK",rownames(covid_moderate),value = T),
+              grep("^IGL",rownames(covid_moderate),value = T),
+              "IGJ")
+rna.marker.list_moderate <- lapply(rna.marker.list_moderate, function(x) {
+  try(x <- x[x$gene %notin% ig.genes,])
+  return(x)
+})
+
+# perturb.score <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/perturb/perturb.score.filter_quality_convalescent_moderatewISG.rds")
+perturb.score.m <- Reduce(cbind,perturb.score )
+colnames(perturb.score.m) <- names( perturb.score  )
+rownames(perturb.score.m) <- mapvalues(rownames(perturb.score.m), from = as.character(rna.meta$Donor), to = as.character(rna.meta$Donor.full))
+
+anno <- unique(row_annotation[row_annotation$Donor.full %in% rownames(perturb.score.m),])
+anno <- anno[match(rownames(perturb.score.m),anno$Donor.full),]
+
+ta = columnAnnotation(Acuity = anno$acuity,
+                      "Severity at draw" = anno$Severity.final.current,
+                      col = list(Acuity = c("Acute" = "orange",
+                                                 "Convalescent" = "purple"),
+                                 "Severity at draw" = c("1-3" = severity.cols[2],
+                                                        "4-5" = severity.cols[3])))
+
+pdf(paste0(conv_supp_fig_path,"a2.pdf"), height = 5, width = 7)
+Heatmap(t(abs(perturb.score.m)), 
+        top_annotation = ta,
+        col = colorRamp2(breaks = c(0,6,12), colors = c("black","purple","yellow")),
+        name = "Perturbation\nscore",
+        column_names_gp = gpar(fontsize=0))
+dev.off()
+# rna.marker.list_moderate <- rna.marker.list
+```
+
+```{r conv panel f}
+covid_moderate <- RunPCA(covid_moderate)
+covid_moderate <- RunUMAP(covid_moderate, dims = 1:50)
+
+#panel c --> must plot legend separately
+p <- DimPlot(covid_moderate,group.by = "acuity", cols=c("orange","purple"), reduction = "umap") + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1)  + theme(legend.position = c(.6,.9))
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+saveit(name = "e", path = conv_supp_fig_path, height = 5, width = 5)
+
+#panel d
+p <- DimPlot(covid_moderate,group.by = "celltype.l2", reduction = "umap", label = T, repel = T, label.size = 4) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank()) + scale_color_igv()
+p$layers[[1]]$aes_params$alpha = .2
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4))) + NoLegend()
+saveit(path = conv_supp_fig_path, name = "e2", height = 5, width = 5)
+```
+
+```{r panel convg}
+cd8tem.moderate.seu <- subset(cd8TEM.seu, cells = intersect(colnames(cd8TEM.seu),colnames(covid_moderate)))
+features.plot <- c((rna.marker.list_moderate[["CD8 TEM"]] %>% filter(abs(avg_logFC)>1))$gene,
+                   (rna.marker.list_moderate[["CD8 TEM"]] %>% filter(abs(avg_logFC)<(-1)))$gene)
+DotPlot(cd8tem.moderate.seu, features = (rna.marker.list_moderate[["CD8 TEM"]] %>% filter(abs(avg_logFC)>1))$gene, group.by = "acuity", cols = "RdYlBu", assay = "RNA", scale = F, dot.scale = 10) + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face = "italic")) + rotate_x_text()
+saveit(name = "f", path = conv_supp_fig_path, width = 6.5, height = 4, format = "pdf")
+
+cd14mono.moderate.seu <- subset(covid_CD14mono, cells = intersect(colnames(covid_CD14mono),colnames(covid_moderate)))
+features.plot <- c((rna.marker.list_moderate[["CD14 Mono"]] %>% filter(abs(avg_logFC)>1))$gene,
+                   (rna.marker.list_moderate[["CD14 Mono"]] %>% filter(abs(avg_logFC)<(-1)))$gene)
+DotPlot(cd14mono.moderate.seu, features = features.plot, group.by = "acuity", cols = "RdYlBu", assay = "RNA", scale = F, dot.scale = 10) + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face = "italic")) + rotate_x_text()
+saveit(name = "f2", path = conv_supp_fig_path, width = 6.5, height = 4, format = "pdf")
+```
+
+```{r panel convh}
+b.markers <- unique(c((rna.marker.list_moderate[["B memory"]] %>% filter((avg_logFC)>1))$gene,
+                    (rna.marker.list_moderate[["B naive"]] %>% filter((avg_logFC)>1))$gene,
+                    (rna.marker.list_moderate[["B immature"]] %>% filter((avg_logFC)>1))$gene,
+                    (rna.marker.list_moderate[["B memory"]] %>% filter((avg_logFC)<(-1)))$gene,
+                    (rna.marker.list_moderate[["B naive"]] %>% filter((avg_logFC)<(-1)))$gene,
+                    (rna.marker.list_moderate[["B immature"]] %>% filter((avg_logFC)<(-1)))$gene))
+
+cells.keep <- intersect(colnames(covid_moderate),
+                        c(colnames(covid_combined)[covid_combined$celltype.l2=="B immature"],
+                          colnames(covid_combined)[covid_combined$celltype.l2=="B naive"],
+                          colnames(covid_combined)[covid_combined$celltype.l2=="B memory"]))
+
+DotPlot(subset(covid_combined, cells = cells.keep), features = b.markers, group.by = "acuity", cols = "RdYlBu", assay = "RNA", scale = F, dot.scale = 10) + labs(x = NULL, y = NULL) + theme(axis.text.x = element_text(face = "italic")) + rotate_x_text()
+saveit(name = "g", path = conv_supp_fig_path, width = 11, height = 4, format = "pdf")
+```
+
+
+### Supplementary Tables ###
+
+
+
+
+```{r PatientMeta}
+#PatientMeta
+# blood.tube <- read.csv("~/Downloads/AJW_current_COVID_sc_Bloodtube.csv")[,c("record_id","vacutainer_type")]
+# meta.full <- read.csv("~/Desktop/COVID_sc_metadata/AJW_current_COVID_sc_metadata.csv")
+meta.st <- merge(meta.full, blood.tube, by = "record_id")
+meta.st <- meta.st[,c("record_id",
+                      "Donor",
+                      "Age",
+                      "Sex",
+                      "PRIMARY_RACE",
+                      "ETHNICITY",
+                      "CANONICAL_ETHNICITY",
+                      "CANONICAL_RACE",
+                      "BMI",
+                      "BMI_GROUP",
+                      "ABO",
+                      "T_SEROLOGY",
+                      "T_POS_SEROL",
+                      "RISK_FACTOR",
+                      "MED_PRESSORS",
+                      "DIALYSIS",
+                      "O2_SUPPORT",
+                      "MAX_SEVERITY_SCORE",
+                      "days_post_pos_test",
+                      "acuity",
+                      "current_severity",
+                      "time_to_death",
+                      "vacutainer_type")]
+#recode age
+meta.st$Age_orig <- meta.st$Age
+meta.st$Age[between(meta.st$Age_orig,18,29)] <- "18-29"
+meta.st$Age[between(meta.st$Age_orig,30,39)] <- "30-39"
+meta.st$Age[between(meta.st$Age_orig,40,49)] <- "40-49"
+meta.st$Age[between(meta.st$Age_orig,50,59)] <- "50-59"
+meta.st$Age[between(meta.st$Age_orig,60,69)] <- "60-69"
+meta.st$Age[between(meta.st$Age_orig,70,79)] <- "70-79"
+meta.st$Age[between(meta.st$Age_orig,80,200)] <- "80+"
+
+my.write(unique(meta.st), 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name=="PatientMeta","mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name=="PatientMeta","mention"],
+                         ". Clinical and demographic metadata of all COVID-19 patients and healthy controls profiled by any modality."),
+         row.names = F)
+```
+
+```{r RNACountsManual}
+name = "RNACountsManual"
+rnacounts <- as.data.frame(table(covid_combined$Donor,as.character(covid_combined$manual.coarse.idents)))
+rnacounts <- dcast(rnacounts, formula = Var1~Var2, value.var = "Freq")
+colnames(rnacounts)[1] <- "Donor"
+
+my.write(rnacounts, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". Counts of cells in scRNA-seq dataset for each donor per manually-annotated cell type."),
+         row.names = F)
+```
+
+```{r RNACountsSeurat}
+name = "RNACountsSeurat"
+rnacounts <- as.data.frame(table(covid_combined$Donor,as.character(covid_combined$celltype.l2)))
+rnacounts <- dcast(rnacounts, formula = Var1~Var2, value.var = "Freq")
+colnames(rnacounts)[1] <- "Donor"
+
+my.write(rnacounts, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". Counts of cells in scRNA-seq dataset for each donor per Seurat v4-annotated cell type."),
+         row.names = F)
+```
+
+```{r ATACCounts}
+name = "ATACCounts"
+ataccounts <- as.data.frame(table(atac.embed$Donor, as.character(atac.embed$cell_type)))
+ataccounts <- dcast(ataccounts, formula = Var1~Var2, value.var = "Freq")
+colnames(ataccounts)[1] <- "Donor"
+
+my.write(ataccounts, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". Counts of cells in scATAC-seq dataset for each donor per Seurat v4-transferred cell type annotation (see Methods)."),
+         row.names = F)
+```
+
+```{r RNAManualDEG}
+name = "RNAManualDEG"
+# rna.markers <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/201113--manual.coarse.idents.markers.rds")
+
+my.write(rna.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". scRNA-seq DEGs for each manually-annotated cell type. Only genes with a positive log(fold-change) for a given cell type are shown. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+
+```{r RNASeuratDEG}
+name = "RNASeuratDEG"
+# rna.markers <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/201113--celltype.l2.markers.rds")
+
+my.write(rna.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". scRNA-seq DEGs for each cell type annotated by Seurat v4-based multimodal reference mapping. Only genes with a positive log(fold-change) for a given cell type are shown. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNASeuratDEP}
+name = "RNASeuratDEP"
+# imputed.protein.markers <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/201112--imputed.protein.markers.noneuts.rds") %>% rename(imputed.protein = gene)
+
+my.write(imputed.protein.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". scRNA-seq differentially-abundant imputed protein levels for each cell type annotated by Seurat v4-based multimodal reference mapping. Only markers with a positive log(fold-change) for a given cell type are shown. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNAcDC2SevDEG}
+name = "RNAcDC2SevDEG"
+Idents(cdc2.seu) <- "Severity.current.final"
+RNAcDC2SevDEG.markers <- FindAllMarkers(cdc2.seu, assay = "RNA", only.pos = T) %>% filter_quality()
+Idents(cdc2.seu) <- "seurat_clusters"
+
+my.write(RNAcDC2SevDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for cDC2 cells by severity. scRNA-seq DEGs for each severity class were calculated using FindAllMarkers, where cells belonging to each severity class are compared to all other cells. Cells annotated as cDC2 cells by Seuratv4 were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNACD8TEMSevDEG}
+name = "RNACD8TEMSevDEG"
+Idents(cd8TEM.seu) <- "Severity.current.final"
+RNACD8TEMSevDEG.markers <- FindAllMarkers(cd8TEM.seu, assay = "RNA", only.pos = T) %>% filter_quality()
+Idents(cd8TEM.seu) <- "seurat_clusters"
+
+my.write(RNACD8TEMSevDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for CD8 TEM cells by severity. scRNA-seq DEGs for each severity class were calculated using FindAllMarkers, where cells belonging to each severity class are compared to all other cells. Cells annotated as CD8 TEM cells by Seuratv4 were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+
+```{r RNAModules}
+name = "RNAModules"
+
+na.pad <- function(x,len){
+    x[1:len]
+}
+
+makePaddedDataFrame <- function(l,...){
+    maxlen <- max(sapply(l,length))
+    data.frame(lapply(l,na.pad,len=maxlen),...)
+}
+
+RNAModules <- makePaddedDataFrame(list(ISG = unique(as.character(ISG.list$gene)),
+                   neut_phagocytosis = unique(phagocytosis_genes),
+                   neut_degranulation = unique(neut_degranulation_genes),
+                   PDL1_neutrophils = unique(pdl1.features$gene),
+                   sepsis_neutrophils = unique(juss.features$Gene.symbol),
+                   sepsis_monocytes = unique(as.character(sepsis$ms2)),
+                   mdsc = unique(mdsc.set$gene),
+                   NK_exhaustion = c("HAVCR2", "PDCD1","LAG3"),
+                   CD8_exhaustion = unique(unname(exh.genes)),
+                   HLA_classII = grep("^HLA-D",rownames(covid_combined),value=T)))
+
+my.write(RNAModules, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". Gene lists used for module scoring (see Methods)."),
+         row.names = F)
+```
+
+```{r RNAMonoSevDEG}
+name = "RNAMonoSevDEG"
+Idents(covid_CD14mono) <- "Severity.current.final"
+RNAMonoSevDEG.markers <- FindAllMarkers(covid_CD14mono, assay = "RNA", only.pos = T) %>% filter_quality()
+Idents(covid_CD14mono) <- "seurat_clusters"
+
+my.write(RNAMonoSevDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for CD14 Monocytes by severity. scRNA-seq DEGs for each severity class were calculated using FindAllMarkers, where cells belonging to each severity class are compared to all other cells. Cells manually-annotated as CD14 monocytes were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNANKSevDEG}
+name = "RNANKSevDEG"
+Idents(covid_NK) <- "Severity.current.final"
+RNANKSevDEG.markers <- FindAllMarkers(covid_NK, assay = "RNA", only.pos = T) %>% filter_quality()
+Idents(covid_NK) <- "seurat_clusters"
+
+my.write(RNANKSevDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for NK cells by severity. scRNA-seq DEGs for each severity class were calculated using FindAllMarkers, where cells belonging to each severity class are compared to all other cells. Cells annotated as NK cells by Seuratv4 were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNANeutSevDEG}
+name = "RNANeutSevDEG"
+Idents(neut_alone) <- "Severity.current.final"
+RNANeutSevDEG.markers <- FindAllMarkers(neut_alone, assay = "RNA", only.pos = T) %>% filter_quality()
+Idents(neut_alone) <- "seurat_clusters"
+
+my.write(RNANeutSevDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for Neutrophils by severity. scRNA-seq DEGs for each severity class were calculated using FindAllMarkers, where cells belonging to each severity class are compared to all other cells. Cells manually-annotated as  neutrophils were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r iRegulonList}
+name = "iRegulonList"
+
+# devneut_ireg <- read_delim("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/iRegulon/devneut.txt", delim = "\t")
+# neut_sev_ireg <- read_delim("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/scRNA/analyses/iRegulon/neut_sev.txt", delim = "\t")
+
+iRegulonList <- makePaddedDataFrame(list(Neutrophils = neut_sev_ireg$rownames.neut_sev.markers.,
+                                         DevNeuts = devneut_ireg$rownames.devneut.markers.))
+
+my.write(iRegulonList, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". Gene lists used for iRegulon transcription factor activity analysis (see Methods)."),
+         row.names = F)
+```
+
+```{r RNADevNeutDEG}
+name = "RNADevNeutDEG"
+
+my.write(devneut.cluster.markers.filtered, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for Developing Neutrophils by cluster. scRNA-seq DEGs for each cluster were calculated using FindAllMarkers, where cells belonging to each cluster are compared to all other cells. Quality-filtered cells manually-annotated as developing neutrophils were used as input. Only DEGs with a >0.25 log(fold-change) are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNAHSPCDEG}
+name = "RNAHSPCDEG"
+RNAHSPCDEG.markers <- FindMarkers(HSPC.seu, assay = "RNA", ident.1 = "COVID", group.by = "Status") %>% rownames_to_column(var = "gene") %>% filter_quality()
+
+my.write(RNAHSPCDEG.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for HSPCs by severity. scRNA-seq DEGs were calculated by FindMarkers, comparing cells from all COVID-19 patients to all healthy control cells. Cells from COVID-19 samples were used as identity class 1, and a positive log(fold-change) reflects higher expression in COVID-19 cells. Cells annotated as HSPCs by Seuratv4 were used as input. Only DEGs with a >0.25 |log(fold-change)| are shown, and cell quality-associated genes are removed. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+```{r RNANeutPilotDEG}
+name = "RNANeutPilotDEG"
+
+my.write(neut_combined.markers, 
+         file = paste0(st_path,"SupplementaryTable_",
+                       STlookup[STlookup$name==name,"mention"],
+                       ".csv"),
+         header = paste0("Supplementary Table ",
+                         STlookup[STlookup$name==name,"mention"],
+                         ". DEGs for each cell type in PBMC and granulocyte healthy donor dataset presented in Supplementary Figure 4. scRNA-seq DEGs for each cell type were calculated using FindAllMarkers, where cells belonging to each cell type are compared to all other cells. Manual cell type annotations based on per-cluster DEGs were used to assign cellular identity. Only DEGs with a >0.25 log(fold-change) are shown. Statistical significance is determined by Seurat's implementation of the Wilcoxon rank-sum test, and two-sided p values are provided."),
+         row.names = F)
+```
+
+
+

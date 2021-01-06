@@ -1,0 +1,244 @@
+---
+title: "Multi-omic profiling reveals widespread dysregulation of innate immunity and hematopoiesis in COVID-19 - CyTOF analysis of Monocytes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load packages
+
+```{r}
+
+library("dplyr")
+library("CytoGLMM")
+library("tidyverse")
+library("reshape2")
+library("magrittr")
+library("stringr")
+library("readr")
+library("devtools")
+library("readxl")
+library("BBmisc")
+library("flowCore")
+library("readxl")
+library("ggplot2")
+library("ggcorrplot")
+library("cowplot")
+library("ggpubr")
+library("scater")
+library("uwot")
+library("diffcyt")
+library("CATALYST")
+library("Seurat")
+library("ComplexHeatmap")
+library("plyr")
+library("formattable")
+library("pals")
+library("clustree")
+library("ggsci")
+library("randomcoloR")
+theme_set(theme_bw())
+
+```
+
+Set working directory
+
+```{r}
+setwd("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live")
+
+```
+
+Read in clustered whole PBMC seurat object.
+
+```{r}
+seu <- readRDS("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/PBMC_clustered_without_HLAs_UMAP_usethis.rds")
+
+```
+
+
+Create an object that contains only monocyte clusters.
+
+```{r}
+Idents(seu) <- "parc_clusters_0.19"
+mono <- subset(seu, idents = c("3", "7"))
+```
+
+Run PARC on monocyte subset. Use several resolutions and visualize later to decide best one.
+
+```{r}
+reticulate::source_python("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/Aaron/Data/run_parc.py")
+
+runPARC.seu <- function(seu, PCA = TRUE, max.dim = NULL, resolution = 1) {
+  if(PCA) {
+    a <- Reductions(seu, "pca")@cell.embeddings
+    if(!is.null(max.dim)) {
+      a <- a[,1:max.dim]
+    }
+  }
+  else {
+    a <- as.matrix(t(GetAssayData(seu)[c(1:4, 7:32),]))
+  }
+  results <- runparc(a, resolution_parameter=resolution)
+  results <- unlist(results)
+  seu@meta.data$parc_clusters <- results
+  return(seu)
+}
+
+resolution.list <- c(0.1, seq(0.15,0.25,0.01), 0.3)
+for (i in 1:length(resolution.list)) {
+  mono <- runPARC.seu(mono, PCA=F, resolution = resolution.list[[i]])
+  mono <- AddMetaData(mono, metadata = mono$parc_clusters, col.name = paste0("parc_clusters_",resolution.list[[i]]))
+  message(paste0("Finished clustering with resolution ",resolution.list[[i]]))
+}
+
+saveRDS(mono, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/mono_clustered_wout_HLA_usethis.rds")
+
+```
+
+Run UMAP on the clustered monocyte object.
+
+```{r}
+
+mono.embed <- uwot::umap(as.matrix(t(GetAssayData(mono, assay = "protein", slot = "data")[c(1:4, 7:32),])),
+                         n_neighbors = 20,
+                         min_dist = 0.2,
+                         metric = "cosine")
+rownames(mono.embed) <- colnames(mono)
+mono[["umapraw"]] <- CreateDimReducObject(embeddings = mono.embed,
+                                          assay = "protein",
+                                          key = "umapraw_")
+saveRDS(mono, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/mono_UMAP_wout_HLA_usethis.rds")
+
+
+```
+
+Create monocyte cluster tree
+
+```{r}
+sub_mono <- subset(mono, cells = sample(colnames(mono),500000))
+clustree(mono, prefix = "parc_clusters_")
+
+```
+
+Generate a UMAP of the monocyte object labeled by cluster.
+
+```{r}
+p <- DimPlot(mono,label = T, repel = T, group.by = "parc_clusters_0.21", label.size = 6) + NoLegend() + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) + labs(x = "UMAP1", y = "UMAP2") 
+p$layers[[1]]$aes_params$alpha = .1
+p
+
+```
+
+Generate a UMAP of monocyte object colored by severity.
+
+``` {r}
+
+p <- DimPlot(mono, group.by = "Severity.max.final", cols=c("green3", "yellow3","steelblue", "red","black"), order = c("8", "6-7", "4-5", "0", "1-3")) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1) 
+p$layers[[1]]$aes_params$alpha = .05
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+
+```
+
+
+Make feature plots of relevant markers
+
+```{r}
+Idents(mono) <- "parc_clusters_0.21"
+FeaturePlot(mono, features = c("CD14", "CD16", "CD4", "HLA-DR", "CD112",  "CCR2"), ncol = 3)
+
+myFeaturePlot <- function(object = NULL, features = features, ncol = NULL, save = T, save.as = "png", height = 7, width = 7, cols = c("lightgrey", "blue"), reduction = "umap") {
+  plots <- lapply(features, function(x) {FeaturePlot(object,features = x, cols = cols, reduction = reduction) +  labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), aspect.ratio = 1, axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title = element_blank(), axis.line = element_blank())})
+  CombinePlots(plots = plots, ncol = ncol)
+  if(save) {
+    if(save.as=="pdf"){
+      ggsave("p.pdf", path = "~/Downloads/", height = height, width = width)
+    }
+    if(save.as=="png"){
+      ggsave("p.png", path = "~/Downloads/", height = height, width = width)
+    }
+  }
+}
+
+myFeaturePlot(mono, features = c("CD14", "CD16", "CD4", "HLA-DR", "CD112", "CCR2"), ncol = 3, reduction = "umapraw")
+```
+
+Create a heatmap of monocyte clusters.
+
+```{r}
+Idents(mono) <- "parc_clusters_0.21"
+scaled.avgexp <- scale(t(AverageExpression(mono, slot = "data")$protein))
+
+rownames(scaled.avgexp) <- gsub("SingleCellExperiment_","",rownames(scaled.avgexp))
+Heatmap(scaled.avgexp, name = "Z-score")
+
+```
+
+Make boxplots of monocyte cluster abundances.
+
+```{r}
+Idents(mono) <- "parc_clusters_0.21"
+my_comparisons = list(c("0", "1-3"), c("0", "4-5"), c("0", "6-7"))
+severity.cols <- c("steelblue","green3", "yellow3", "red", "black")
+
+covid.seuAbundances(mono, by = "cell.type", meta.include = c("orig.ident", "sample_id", "conv", "deceased", "condition", "Severity.current.final", "Severity.max.final", "acuity"), group_by = "Severity.current.final", color_by = "Severity.max.final", custom_fill_colors = severity.cols, shape_by = "acuity", each.pt = "sample_id") + scale_y_continuous(expand = expansion(mult = c(0.05,0.2))) + theme(text=element_text(size=20)) + NoLegend()
+
+```
+
+Make boxplots of arcsinh transformed expression of individual markers in monocytes.
+
+```{r}
+FeatureBoxPlot(mono, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("CD4", "HLA-DR", "CD112", "CCR2"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = 1, label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+FeatureBoxPlot(mono, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("CD155"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = , label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+FeatureBoxPlot(mono, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("CD112", "ULBP-1-2-5-6"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = , label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+FeatureBoxPlot(mono, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("LLT-1"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = , label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+```
+
+Make boxplot of CCR2 expression on non-classical monocytes.
+
+```{r}
+Idents(mono) <- "parc_clusters_0.21"
+nonclassical <- subset(mono, idents = "3")
+
+FeatureBoxPlot(nonclassical, by = "features", assay = "protein", slot = "counts", exprs.function = "mean",
+                           features = c("CCR2"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = , label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+```
+
+
+
+
+
+
+
+

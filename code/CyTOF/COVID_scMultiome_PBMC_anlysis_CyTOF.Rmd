@@ -1,0 +1,342 @@
+---
+title: "Multi-omic profiling reveals widespread dysregulation of innate immunity and hematopoiesis in COVID-19 - CyTOF analysis of PBMC"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load packages
+
+```{r}
+
+library("dplyr")
+library("CytoGLMM")
+library("tidyverse")
+library("reshape2")
+library("magrittr")
+library("stringr")
+library("readr")
+library("devtools")
+library("readxl")
+library("BBmisc")
+library("flowCore")
+library("readxl")
+library("ggplot2")
+library("ggcorrplot")
+library("cowplot")
+library("ggpubr")
+library("scater")
+library("uwot")
+library("diffcyt")
+library("CATALYST")
+library("Seurat")
+library("ComplexHeatmap")
+library("plyr")
+library("formattable")
+library("pals")
+library("clustree")
+library("ggsci")
+library("randomcoloR")
+theme_set(theme_bw())
+
+```
+
+Set working directory
+
+```{r}
+setwd("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live")
+
+```
+
+Make a function that creates matrix out of the expression data stored in fcs files and call it on directory of interest.
+
+```{r make seurat}
+prepareSeuratObject <- function(path = NULL, meta = NULL, panel = NULL, cofactor = 5) {
+  files.read <- paste0(path,list.files(path = path, pattern = ".fcs"))
+  file.names <- gsub(".fcs","",list.files(path = path, pattern = ".fcs"))
+  panel <- panel %>% mutate_all(as.character)
+  message("Reading FCS files")
+  fcs.files <- lapply(files.read, function(x){
+    file <- read.FCS(x, ignore.text.offset = TRUE)@exprs
+    names(colnames(file)) <- NULL
+    file <- file[,colnames(file) %in% panel$fcs_colname]
+    colnames(file) <- mapvalues(colnames(file), from = panel$fcs_colname, to = panel$antigen)
+    file.name <- gsub(".*/","",x)
+    file.name <- gsub(".fcs","",file.name)
+    rownames(file) <- paste(file.name,1:nrow(file),sep=".")
+    return(file)
+   
+  })
+  message("Finished reading FCS files")
+  names(fcs.files) <- gsub(".fcs","", gsub(".*/","",files.read))
+  fcs.files <- fcs.files[paste0(names(fcs.files),".fcs") %in% meta$file_name]
+  mtx <- do.call("rbind",fcs.files)
+  mtx.protein <- mtx[,colnames(mtx) %in% panel$antigen[panel$marker_class=="protein"]]
+  mtx.tf <- asinh(mtx.protein/cofactor)
+  mtx.meta <- mtx[,colnames(mtx) %in% panel$antigen[panel$marker_class=="quality"]]
+  message("Creating Seurat object")
+  #rownames(mtx.tf) <- gsub("\\+","",rownames(mtx.tf))
+  #rownames(mtx.tf) <- gsub("\\-","",rownames(mtx.tf))
+  seu <- CreateSeuratObject(t(mtx.tf),assay = "protein",names.field = 1, names.delim = "\\.")
+  seu$orig.ident <- colnames(seu)
+  seu$orig.ident <- gsub("\\..*","",seu$orig.ident)
+  seu@meta.data <- cbind(seu@meta.data, mtx.meta)
+  seu$file_name <- paste0(seu$orig.ident,".fcs")
+  seu$cell.name <- rownames(seu[[]])
+  meta.seu <- seu[[]]
+  meta.merge <- merge(meta.seu, meta, by = "file_name")
+  meta.merge <- meta.merge[match(colnames(seu),meta.merge$cell.name),]
+  rownames(meta.merge) <- colnames(seu)
+  seu@meta.data <- meta.merge
+  seu@assays$protein@counts <- mtx.protein
+  return(seu)
+}
+
+```
+
+
+Call PrepareSeurat function to create a seurat object out of fcs files
+```{r}
+seu <- prepareSeuratObject(path = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/",
+                           meta = read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/COVID_PBMC.csv"),
+                           panel = read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/markers_COVID_PBMC.csv"))
+
+saveRDS(seu, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/seu_COVID_PBMC.rds")
+
+```
+
+
+Prepare PARC clustering function.
+```{r}
+reticulate::source_python("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/Aaron/Data/run_parc.py")
+
+runPARC.seu <- function(seu, PCA = TRUE, max.dim = NULL, resolution = 1) {
+  if(PCA) {
+    a <- Reductions(seu, "pca")@cell.embeddings
+    if(!is.null(max.dim)) {
+      a <- a[,1:max.dim]
+    }
+  }
+  else {
+    a <- as.matrix(t(GetAssayData(seu)[c(1:4, 7:32),]))
+  }
+  results <- runparc(a, resolution_parameter=resolution)
+  results <- unlist(results)
+  seu@meta.data$parc_clusters <- results
+  return(seu)
+}
+
+```
+
+
+Cluster seurat object. Run with multiple resolutions and determine best one later. Save as RDS so we don't have to do this again.
+```{r}
+resolution.list <- c(0, 0.1, seq(0.15,0.25,0.01), 0.3)
+seu$old_parc_clusters <- seu$parc_clusters
+
+for (i in 1:length(resolution.list)) {
+  seu <- runPARC.seu(seu, PCA=F, resolution = resolution.list[[i]])
+  seu <- AddMetaData(seu, metadata = seu$parc_clusters, col.name = paste0("parc_clusters_",resolution.list[[i]]))
+  message(paste0("Finished clustering with resolution ",resolution.list[[i]]))
+}
+
+saveRDS(seu, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/PBMC_clustered_without_HLAs_usethis.rds")
+```
+
+
+Run UMAP on clustered seurat object.
+```{r}
+seu.embed <- uwot::umap(as.matrix(t(GetAssayData(seu, assay = "protein", slot = "data")[c(1:4, 7:32),])),
+                         n_neighbors = 20,
+                         min_dist = 0.2,
+                         metric = "cosine")
+rownames(seu.embed) <- colnames(seu)
+seu[["umapraw"]] <- CreateDimReducObject(embeddings = seu.embed,
+                                          assay = "protein",
+                                          key = "umapraw_")
+saveRDS(seu, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/PBMC_clustered_without_HLAs_UMAP_usethis.rds")
+```
+
+
+Un-transform "counts" column to get raw MSIs back.
+```{r}
+data.raw <- sinh(GetAssayData(seu, assay = "protein", slot = "data"))*5
+seu@assays$protein@counts <- data.raw
+```
+
+
+Pull metadata from master file to ensure consistency across all analyses
+```{r}
+orig.metadata <- seu[[]] ##take the original metadata and store it for safe keeping
+metadata <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/AJW_current_COVID_sc_metadata.csv")
+flu.meta <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/NK_COVID_UMAP_flu_meta.csv")
+metadata %<>% dplyr::rename(sample_id = "Donor")
+flu.meta %<>% dplyr::rename(sample_id = "Donor")
+all.meta <- rbind(metadata, flu.meta)
+all.meta[all.meta$sample_id=="28205-0555d0", "sample_id"] <- "28205-0555-1 (3/24)"
+all.meta[all.meta$sample_id=="28205-0555d2", "sample_id"] <- "28205-0555-2 (3/26)"
+all.meta[all.meta$sample_id=="55650-0066d0", "sample_id"] <- "55650-0066"
+all.meta[all.meta$sample_id=="55650-0066d7", "sample_id"] <- "55650-0066 D7"
+all.meta[all.meta$sample_id=="55650-0132d0", "sample_id"] <- "55650-0132 D0"
+all.meta[all.meta$sample_id=="28205-0564d2", "sample_id"] <- "28205-0564-2"
+all.meta[all.meta$sample_id=="28205-0564d0", "sample_id"] <- "28205-0564-1"
+
+all.meta %<>% dplyr::filter(sample_id != "55650-0084" & sample_id != "55650-0132d7" & sample_id != "55689-0037" & sample_id != "HIP022" & sample_id != "HIP046" & sample_id != "28205-0566")
+
+
+seu$Severity.current <- mapvalues(seu$sample_id, from = all.meta$sample_id, to = all.meta$current_severity) 
+seu$Severity.max <- mapvalues(seu$sample_id, from = all.meta$sample_id, to = all.meta$MAX_SEVERITY_SCORE)
+
+seu$Severity.current.final <- mapvalues(seu$Severity.current, 
+                                                 from = c("0", "1","2", "3", "4","5", "6", "7"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7","6-7"))
+seu$Severity.max.final <- mapvalues(seu$Severity.max, 
+                                                 from = c("0", "1","2", "3", "4","5","6", "7", "8"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7","6-7", "8"))
+
+
+seu$Severity.current.final <- factor(seu$Severity.current.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+seu$Severity.max.final <- factor(seu$Severity.max.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+
+seu@meta.data %<>% mutate(acuity = ifelse(conv == "Y", "Convalescent", "Acute"))
+seu@meta.data %<>% mutate(acuity = ifelse(Severity.max.final == "0", "Healthy", acuity))
+
+seu$acuity <- factor(seu$acuity, levels = c("Healthy", "Acute", "Convalescent"))
+levels(seu$acuity)
+
+```
+
+Generate a cluster tree for all PBMC to decide which resolution is best to move forward with.
+```{r}
+sub_seu <- subset(seu, cells = sample(colnames(seu),100000))
+clustree(sub_seu, prefix = "parc_clusters_") + labs(color = "Resolution")
+
+```
+
+
+Generate a heatmap of marker expression by cluster.
+```{r}
+Idents(seu) <- "parc_clusters_0.19"
+scaled.avgexp <- scale(t(AverageExpression(seu, add.ident = "parc_clusters_0.19", slot = "data")$protein))
+rownames(scaled.avgexp) <- gsub("SingleCellExperiment_","",rownames(scaled.avgexp))
+Heatmap(t(scaled.avgexp))
+
+```
+
+Annotate clusters based on heatmap.
+```{r}
+Idents(seu) <- "parc_clusters_0.19"
+sort(levels(seu))
+new.cluster.ids <- c("CD4 T", "CD8 T", "CD4 T", "Other Myeloid Cells", "NK", "CD14 Monocyte", "B", "CD8 T", "CD4 T", "CD16 Monocyte", "Misc T", "CD4 T")
+names(new.cluster.ids) <- sort(levels(seu))
+seu <- RenameIdents(seu, new.cluster.ids)
+seu$annotated_clusters <- Idents(seu)
+levels(Idents(seu))
+
+#saveRDS(seu, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART #CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/seu_0.21_UMAP_annotated.rds")
+
+```
+
+Generate another heatmap with the correct cluster annotations.
+``` {r}
+scaled.avgexp <- scale(t(AverageExpression(seu, slot = "data")$protein))
+rownames(scaled.avgexp) <- gsub("SingleCellExperiment_","",rownames(scaled.avgexp))
+Heatmap(t(scaled.avgexp), name = "Z-score")
+
+```
+
+Generate color palette for UMAP for consistency with other modalities
+```{r}
+cell_type_colors <- c(
+    "#D51F26", "#272E6A", "#208A42", "#89288F", "#F47D2B", 
+    "#FEE500", "#8A9FD1", "#C06CAB", "#E6C2DC", "#90D5E4", 
+    "#89C75F", "#F37B7D", "#9983BD", "#D24B27", "#3BBCA8", 
+    "#6E4B9E", "#0C727C", "#7E1416", "#D8A767", "#3D3D3D")
+
+names(cell_type_colors) <-c(
+    "CD14 Monocyte", "CD16 Monocyte", "CD4 T", "CD8 T", "NK", 
+    "B", "PB", "Neutrophil", "Developing neutrophil", "DC", 
+    "pDC", "Eos/Mast Prog", "Prolif Lymph", "Platelet", "Eryth", 
+    "HSPC", "Misc T", "Other Myeloid Cells", "UNUSED", "UNUSED")
+
+```
+
+Generate a UMAP colored by disease severity.
+```{r}
+severity.cols <- c("steelblue","green3", "yellow3", "red","black")
+p <- DimPlot(seu,group.by = "Severity.max.final", cols=c("green3", "yellow3","steelblue", "red","black"), order = c("8", "6-7", "0", "4-5", "1-3")) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1, axis.title = element_text(size = 20))  + NoLegend()
+p$layers[[1]]$aes_params$alpha = .02
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=4)))
+
+saveit <- function(format = "png", height = 7, width = 7, path = "G:/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/transformed_msi_figures/", name = "p") {
+  if(format=="png") {
+    ggsave(paste0(name,".png"), path = path, height = height, width = width, dpi = "retina")
+  }
+  if(format=="pdf") {
+    ggsave(paste0(name,".pdf"), path = path, height = height, width = width)
+  }
+}
+saveit()
+           
+```
+
+Generate a UMAP colored by cell type
+```{r}
+p <- DimPlot(seu,label = T, repel = T, label.size = 6, cols = cell_type_colors) + NoLegend() +
+labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1, axis.title = element_text(size = 20)) 
+p$layers[[1]]$aes_params$alpha = .02
+p
+saveit()
+
+```
+
+
+Generate a UMAP colored by donor
+```{r}
+p <- DimPlot(seu,group.by = "patient_id", cols = cols) + labs(x = "UMAP1", y = "UMAP2") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(), aspect.ratio = 1)
+p$layers[[1]]$aes_params$alpha = .02
+p + guides(colour = guide_legend(override.aes = list(alpha = 1,size=2)))
+
+```
+
+Make boxplots of cluster abundance
+```{r}
+seu$cell.type = seu$annotated_clusters
+my_comparisons = list(c("0", "1-3"), c("0", "4-5"), c("0", "6-7"))
+
+covid.seuAbundances(seu, by = "cell.type", meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"), group_by = "Severity.current.final", color_by = "Severity.max.final", custom_fill_colors = severity.cols, ncol = 3, shape_by = "acuity") + scale_y_continuous(expand = expansion(mult = c(0.05,0.2))) +theme(text=element_text(size=20)) + NoLegend()
+
+```
+
+Make individual NK abundance box plot
+```{r}
+covid.seuAbundances(seu, by = "cell.type", meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"), group_by = "Severity.current.final", color_by = "Severity.max.final", custom_fill_colors = severity.cols, ncol = 3, shape_by = "acuity", select.idents = "NK") + scale_y_continuous(expand = expansion(mult = c(0.05,0.2))) +theme(text=element_text(size=20)) + NoLegend()
+
+```
+
+Make boxplot of CD161 expression in NK cells.
+```{r}
+Idents(seu) <- "parc_clusters_0.19"
+nk <- subset(seu, idents = "2")
+
+FeatureBoxPlot(nk, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("CD161"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = , label = "p.signif", select.idents = NULL, 
+                           label.x = NA, pt.size = NA) + NoLegend() + theme(text=element_text(size=20))
+
+```
+
+Calculate cell type counts per donor.
+```{r}
+cytof_counts <- as.data.frame(table(seu$patient_id,as.character(seu$annotated_clusters)))
+cytof_counts <- dcast(cytof_counts, formula = Var1~Var2, value.var = "Freq")
+colnames(cytof_counts)[1] <- "Donor"
+
+write.csv(cytof_counts, "donor_celltype_counts_cytof.csv")
+
+```

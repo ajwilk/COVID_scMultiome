@@ -1,0 +1,460 @@
+---
+title: "Multi-omic profiling reveals widespread dysregulation of innate immunity and hematopoiesis in COVID-19 - CyTOF analysis of NK cells"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load packages
+
+```{r}
+
+library("dplyr")
+library("CytoGLMM")
+library("tidyverse")
+library("reshape2")
+library("magrittr")
+library("stringr")
+library("readr")
+library("devtools")
+library("readxl")
+library("BBmisc")
+library("flowCore")
+library("readxl")
+library("ggplot2")
+library("ggcorrplot")
+library("cowplot")
+library("ggpubr")
+library("scater")
+library("uwot")
+library("diffcyt")
+library("CATALYST")
+library("Seurat")
+library("ComplexHeatmap")
+library("plyr")
+library("formattable")
+library("pals")
+library("clustree")
+library("ggsci")
+library("randomcoloR")
+library("CytoGLMM")
+library("tidyverse")
+library("reshape2")
+library("magrittr")
+library("stringr")
+library("readr")
+library("devtools")
+library("readxl")
+library("BBmisc")
+library("flowCore")
+library("readxl")
+library("ggplot2")
+library("ggcorrplot")
+library("cowplot")
+library("ggpubr")
+library("CATALYST")
+theme_set(theme_bw())
+
+```
+
+Set working directory
+
+```{r}
+setwd("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports")
+
+```
+
+Make a function that creates matrix out of the expression data stored in fcs files and call it on directory of interest.
+
+```{r make seurat}
+prepareSeuratObject <- function(path = NULL, meta = NULL, panel = NULL, cofactor = 5) {
+  files.read <- paste0(path,list.files(path = path, pattern = ".fcs"))
+  file.names <- gsub(".fcs","",list.files(path = path, pattern = ".fcs"))
+  panel <- panel %>% mutate_all(as.character)
+  message("Reading FCS files")
+  fcs.files <- lapply(files.read, function(x){
+    file <- read.FCS(x, ignore.text.offset = TRUE)@exprs
+    names(colnames(file)) <- NULL
+    file <- file[,colnames(file) %in% panel$fcs_colname]
+    colnames(file) <- mapvalues(colnames(file), from = panel$fcs_colname, to = panel$antigen)
+    file.name <- gsub(".*/","",x)
+    file.name <- gsub(".fcs","",file.name)
+    rownames(file) <- paste(file.name,1:nrow(file),sep=".")
+    return(file)
+   
+  })
+  message("Finished reading FCS files")
+  names(fcs.files) <- gsub(".fcs","", gsub(".*/","",files.read))
+  fcs.files <- fcs.files[paste0(names(fcs.files),".fcs") %in% meta$file_name]
+  mtx <- do.call("rbind",fcs.files)
+  mtx.protein <- mtx[,colnames(mtx) %in% panel$antigen[panel$marker_class=="protein"]]
+  mtx.tf <- asinh(mtx.protein/cofactor)
+  mtx.meta <- mtx[,colnames(mtx) %in% panel$antigen[panel$marker_class=="quality"]]
+  message("Creating Seurat object")
+  #rownames(mtx.tf) <- gsub("\\+","",rownames(mtx.tf))
+  #rownames(mtx.tf) <- gsub("\\-","",rownames(mtx.tf))
+  seu <- CreateSeuratObject(t(mtx.tf),assay = "protein",names.field = 1, names.delim = "\\.")
+  seu$orig.ident <- colnames(seu)
+  seu$orig.ident <- gsub("\\..*","",seu$orig.ident)
+  seu@meta.data <- cbind(seu@meta.data, mtx.meta)
+  seu$file_name <- paste0(seu$orig.ident,".fcs")
+  seu$cell.name <- rownames(seu[[]])
+  meta.seu <- seu[[]]
+  meta.merge <- merge(meta.seu, meta, by = "file_name")
+  meta.merge <- meta.merge[match(colnames(seu),meta.merge$cell.name),]
+  rownames(meta.merge) <- colnames(seu)
+  seu@meta.data <- meta.merge
+  seu@assays$protein@counts <- mtx.protein
+  return(seu)
+}
+
+```
+
+
+Call PrepareSeurat function to create a seurat object out of fcs files
+```{r}
+seu <- prepareSeuratObject(path = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/",
+                           meta = read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/COVID_NK.csv"),
+                           panel = read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/markers_COVID_NK.csv"))
+
+saveRDS(seu, file = "/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/seu_COVID_NK.rds")
+
+```
+
+
+Un-transform "counts" column to get raw MSIs back.
+```{r}
+data.raw <- sinh(GetAssayData(seu, assay = "protein", slot = "data"))*5
+seu@assays$protein@counts <- data.raw
+```
+
+
+Ensure metadata is structured properly and remove flu samples.
+```{r}
+rownames(seu@meta.data) <- colnames(seu)
+Idents(seu) <- "condition"
+seu <- subset(seu, idents = c("Healthy", "Mild", "Moderate", "Severe"))
+
+```
+
+
+Pull metadata from master file to ensure consistency across all analyses
+```{r}
+orig.metadata <- mono[[]] ##take the original metadata and store it for safe keeping
+metadata <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/AJW_current_COVID_sc_metadata.csv")
+flu.meta <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/NK_use this/normed_NK/debarcoded/CytoNormed/FlowJo_exports/NK_COVID_UMAP_flu_meta.csv")
+metadata %<>% dplyr::rename(sample_id = "Donor")
+flu.meta %<>% dplyr::rename(sample_id = "Donor")
+all.meta <- rbind(metadata, flu.meta)
+all.meta[all.meta$sample_id=="28205-0555d0", "sample_id"] <- "28205-0555-1 (3/24)"
+all.meta[all.meta$sample_id=="28205-0555d2", "sample_id"] <- "28205-0555-2 (3/26)"
+all.meta[all.meta$sample_id=="55650-0066d0", "sample_id"] <- "55650-0066"
+all.meta[all.meta$sample_id=="55650-0066d7", "sample_id"] <- "55650-0066 D7"
+all.meta[all.meta$sample_id=="55650-0132d0", "sample_id"] <- "55650-0132 D0"
+all.meta[all.meta$sample_id=="28205-0564d2", "sample_id"] <- "28205-0564-2"
+all.meta[all.meta$sample_id=="28205-0564d0", "sample_id"] <- "28205-0564-1"
+
+all.meta %<>% dplyr::filter(sample_id != "55650-0084" & sample_id != "55650-0132d7" & sample_id != "55689-0037" & sample_id != "HIP022" & sample_id != "HIP046" & sample_id != "28205-0566")
+
+
+seu$Severity.current <- mapvalues(seu$sample_id, from = all.meta$sample_id, to = all.meta$current_severity) 
+seu$Severity.max <- mapvalues(seu$sample_id, from = all.meta$sample_id, to = all.meta$MAX_SEVERITY_SCORE)
+
+seu$Severity.current.final <- mapvalues(seu$Severity.current, 
+                                                 from = c("0", "1","2", "3", "4","5", "7"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7"))
+seu$Severity.max.final <- mapvalues(seu$Severity.max, 
+                                                 from = c("0", "1","2", "3", "4","5","7", "8"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7", "8"))
+
+
+seu$Severity.current.final <- factor(seu$Severity.current.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+seu$Severity.max.final <- factor(seu$Severity.max.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+
+seu@meta.data %<>% mutate(acuity = ifelse(conv == "Y", "Convalescent", "Acute"))
+seu@meta.data %<>% mutate(acuity = ifelse(Severity.max.final == "0", "Healthy", acuity))
+
+seu$acuity <- factor(seu$acuity, levels = c("Healthy", "Acute", "Convalescent"))
+levels(seu$acuity)
+
+```
+
+
+Make feature boxplots with Aaron's function
+```{r}
+
+my_comparisons = list(c("0", "1-3"), c("0", "4-5"), c("0", "6-7"))
+my_comparisons1 = list(c("0", "1-3"), c("0", "4-5"), c("0", "6-7"), c("0", "8"))
+severity.cols <- c("steelblue","green3", "yellow3", "red", "black")
+
+FeatureBoxPlot(seu, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("Perforin", "Ki-67"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons1, color_by = "Severity.max.final", group_by = "Severity.max.final",
+                           ncol = 3, label = "p.signif", select.idents = NULL, shape_by = "acuity",
+                           label.x = NA, pt.size = NA) + theme(text=element_text(size=20), aspect.ratio = 1) + NoLegend()
+
+FeatureBoxPlot(seu, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("CD38", "CD69", "FAS-L"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons1, color_by = "Severity.max.final", group_by = "Severity.max.final",
+                           ncol = 3, label = "p.signif", select.idents = NULL, shape_by = "acuity",
+                           label.x = NA, pt.size = NA) + theme(text=element_text(size=20), aspect.ratio = 1) + NoLegend()
+
+FeatureBoxPlot(seu, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("NKG2D"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = 3, label = "p.signif", select.idents = NULL, shape_by = "acuity",
+                           label.x = NA, pt.size = NA) + theme(text=element_text(size=20), aspect.ratio = 1) + NoLegend()
+
+FeatureBoxPlot(seu, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("DNAM-1"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = 3, label = "p.signif", select.idents = NULL, shape_by = "acuity",
+                           label.x = NA, pt.size = NA) + theme(text=element_text(size=20), aspect.ratio = 1) + NoLegend()
+
+FeatureBoxPlot(seu, by = "features", assay = "protein", slot = "data", exprs.function = "mean",
+                           features = c("TIGIT", "CD96"), meta.include = c("orig.ident", "sample_id", "conv", "Fatal",   "condition", "Severity.current.final", "Severity.max.final", "acuity"),
+                           each.pt = "orig.ident", custom_fill_colors = severity.cols,
+                           comparisons = my_comparisons, color_by = "Severity.max.final", group_by = "Severity.current.final",
+                           ncol = 3, label = "p.signif", select.idents = NULL, shape_by = "acuity",
+                           label.x = NA, pt.size = NA) + theme(text=element_text(size=20), aspect.ratio = 1) + NoLegend()
+
+```
+
+
+Load in NK cell subset proportions & add necessary metadata
+```{r}
+df_nk <- read.csv("/Volumes/GoogleDrive/My Drive/Blish Lab/00 - All Server Data and Folders/COVID_sc/CyTOF/COVID+VAXART CyTOF Runs/All COVID CyTOF Files/Ligand_all/normed/debarcoded/Live/nk_subset_props.csv")
+
+df_nk$Severity.current <- mapvalues(df_nk$sample_id, from = all.meta$sample_id, to = all.meta$current_severity) 
+df_nk$Severity.max <- mapvalues(df_nk$sample_id, from = all.meta$sample_id, to = all.meta$MAX_SEVERITY_SCORE)
+
+df_nk$Severity.current.final <- mapvalues(df_nk$Severity.current, 
+                                                 from = c("0", "1","2", "3", "4","5", "7"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7"))
+df_nk$Severity.max.final <- mapvalues(df_nk$Severity.max, 
+                                                 from = c("0", "1","2", "3", "4","5","7", "8"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7", "8"))
+df_nk %<>% mutate(Severity.current.final = ifelse(acuity == "Convalescent", "Convalescent", Severity.current.final))
+
+df_nk$Severity.current.final <- factor(df_nk$Severity.current.final, levels = c("0", "1-3", "4-5", "6-7", "Convalescent"))
+df_nk$Severity.max.final <- factor(df_nk$Severity.max.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+
+df_nk %<>% mutate(acuity = ifelse(conv == "Y", "Convalescent", "Acute"))
+df_nk %<>% mutate(acuity = ifelse(Severity.max.final == "0", "Healthy", acuity))
+
+df_nk$acuity <- factor(df_nk$acuity, levels = c("Healthy", "Acute", "Convalescent"))
+
+df_nk %<>% na.omit()
+
+df_nk %<>% dplyr::select(-conv, -deceased, -condition, -Severity.current, -Severity.max)
+
+```
+
+Subset into freq of total and freq of NKs
+```{r}
+df_nk_nk <- df_nk %>% dplyr::select(-CD56neg_total, -CD56bright_total, -CD56dim_total)
+df_nk_tot <- df_nk %>% dplyr::select(-CD56neg, -CD56bright, -CD56dim)
+
+```
+
+Gather into long tables for ease of graphing
+```{r}
+graph_nk = gather(df_nk_nk, cell.type, freq, 
+                 -file_name, -sample_id, -Severity.max.final, -Severity.current.final, -acuity)
+graph_total = gather(df_nk_tot, cell.type, freq, 
+                 -file_name, -sample_id, -Severity.max.final, -Severity.current.final, -acuity)
+
+graph_activated = df_nk
+graph_activated %<>% dplyr::rename(freq = "Activated_NK")
+graph_activated$cell.type = "Activated NK"
+
+```
+
+Attempt to call the cannibalized version of Aaron's graphing function
+```{r}
+covid.seuAbundances.manual(df = graph_activated, by = "cell.type",
+                                 group_by = "Severity.current.final", shape_by = "acuity", each.pt = "sample_id",
+                                 color_by = "Severity.max.final", custom_fill_colors = severity.cols,
+                                 comparisons = my_comparisons, ylab = "Proportion of all\n NK cells (%)",
+                                 ncol = 4, label = "p.signif", 
+                                 pt.size = 4, freq = "freq") + 
+                                 theme(text=element_text(size=20), aspect.ratio = 1) + 
+                                 NoLegend() + scale_y_continuous(expand = expansion(mult = c(0.05,0.2)))
+
+```
+
+Load in data for activated NK cell files and add metadata.
+```{r}
+df_nk <- read.csv("NK_COVID_activated_vs_non.csv")
+df_nk$Severity.current <- mapvalues(df_nk$sample_id, from = all.meta$sample_id, to = all.meta$current_severity) 
+df_nk$Severity.max <- mapvalues(df_nk$sample_id, from = all.meta$sample_id, to = all.meta$MAX_SEVERITY_SCORE)
+
+df_nk$Severity.current.final <- mapvalues(df_nk$Severity.current, 
+                                                 from = c("0", "1","2", "3", "4","5", "7"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7"))
+df_nk$Severity.max.final <- mapvalues(df_nk$Severity.max, 
+                                                 from = c("0", "1","2", "3", "4","5","7", "8"), 
+                                                 to = c("0", "1-3","1-3", "1-3", "4-5","4-5","6-7", "8"))
+
+df_nk$Severity.current.final <- factor(df_nk$Severity.current.final, levels = c("0", "1-3", "4-5", "6-7"))
+df_nk$Severity.max.final <- factor(df_nk$Severity.max.final, levels = c("0", "1-3", "4-5", "6-7", "8"))
+
+df_nk %<>% mutate(acuity = ifelse(conv == "Y", "Convalescent", "Acute"))
+df_nk %<>% mutate(acuity = ifelse(Severity.max.final == "0", "Healthy", acuity))
+
+df_nk$acuity <- factor(df_nk$acuity, levels = c("Healthy", "Acute", "Convalescent"))
+
+df_nk %<>% na.omit()
+
+df_nk %<>% dplyr::select(-conv, -deceased, -condition, -Severity.current, -Severity.max)
+
+```
+
+Create sample table.
+```{r read_csv}
+sample_table = df_nk
+sample_table
+
+sample_table %<>% na.omit()
+```
+
+Load marker isotopes and protein names.
+
+```{r load_markers}
+
+markers_file_name = "markers_comparison_COVID_NK.csv"
+markers = read_csv(markers_file_name,
+                   col_types = cols(isotope = col_character(),
+                                    protein = col_character(),
+                                    type = col_factor(c("extracellular",
+                                                        "intracellular"))))
+markers %<>% dplyr::rename(protein_name = "protein")
+
+
+```
+
+Load samples text files.
+
+```{r import}
+
+df_samples = lapply(sample_table$file_name, function(file_name) {
+  cat(as.character(file_name),"\n")
+  fcsB = read.FCS(file_name,transformation = FALSE)
+  marker_ids = which(colnames(fcsB) %in% markers$isotope)
+  exprs = as_tibble(fcsB@exprs[,marker_ids])
+  add_column(ceiling(exprs),
+             file_name = file_name)
+}) %>% bind_rows
+df_samples %<>% inner_join(sample_table,by = "file_name")
+df_samples_copy = df_samples
+```
+
+Change marker name from isotope name to protein name and remove markers that are unmapped.
+
+```{r map_protein_names}
+new_col_names = markers$protein_name
+names(new_col_names) = markers$isotope
+df_samples = plyr::rename(df_samples, new_col_names)
+protein_names = markers$protein_name
+cols = colnames(sample_table)
+sample_info_names = cols
+df_samples %<>% select(c(sample_info_names,protein_names))
+str(df_samples)
+```
+
+Looks like there are some minus counts? We will set them to zero.
+
+```{r minus_counts}
+mean(df_samples[,protein_names] < 0)
+sum(df_samples[,protein_names] < 0)
+min(df_samples[,protein_names])
+make_zero = function(expr) ifelse(expr < 0,yes = 0,no = expr)
+df_samples %<>% 
+  dplyr::mutate_at(.vars = protein_names, .funs = make_zero)
+sum(df_samples[,protein_names] < 0)
+```
+
+## Quality Control and Data Exploration
+
+To visualize results we first transform data data using `asinh`. 
+
+```{r asinh}
+tfm = function(expr) asinh(expr/5)
+df_samples_tfm = df_samples %>% 
+  dplyr::mutate_at(.vars = protein_names, .funs = tfm)
+
+```
+
+Remove plate controls
+
+```{r remove controls}
+df_samples_tfm_samples = df_samples_tfm #%>% dplyr::filter(donor != "EV08")
+df_samples_samples = df_samples# %>% dplyr::filter(donor != "EV08")
+protein_names = protein_names[-8]
+protein_names
+df_samples_tfm_samples = df_samples_tfm %>% select(-KIR2DS4)
+
+#saveRDS(df_samples_tfm_samples, "df_samples_tfm_samples_nk.rds")
+#saveRDS(df_samples_samples, "df_samples_samples_nk.rds")
+```
+
+
+First, we need to calculate the MFI for each donor and each marker
+```{r}
+df_sample_mean = df_samples_samples %>%
+  group_by(sample_id, Severity.max.final, Severity.current.final, acuity) %>%
+  summarise_at(.vars = protein_names, .funs=mean)
+df_sample_mean
+
+df_sample_mean_tfm = df_samples_tfm_samples %>%
+  group_by(sample_id, Severity.max.final, Severity.current.final, acuity) %>%
+  summarise_at(.vars = protein_names, .funs=mean)
+df_sample_mean
+
+df_sample_mean_tfm %<>% dplyr::rename('DNAM-1' = "DNAM_1")
+```
+
+Then, we rearrange the table so all the markers are in one long column (this makes it possible to graph)
+```{r}
+graph = gather(df_sample_mean, protein_name, MFI, 
+                 -sample_id, -Severity.max.final, -Severity.current.final, -acuity)
+
+graph_tfm = gather(df_sample_mean_tfm, protein_name, MFI, 
+                 -sample_id, -Severity.max.final, -Severity.current.final, -acuity)
+
+```
+
+
+Last, we can make barplots for each marker
+```{r}
+
+graph_sub <- graph_tfm %>% dplyr::filter(protein_name == "DNAM-1" | protein_name == "NKG2D")
+
+
+p <- ggplot(graph_sub, aes_string(x = "Severity.current.final", y = "MFI")) + 
+  labs(x = NULL, y = "Transformed expression") + 
+  theme_bw() + 
+  theme(panel.grid.minor = element_blank(), panel.grid.major = element_blank(), strip.background = element_rect(fill = NA, color = NA), 
+        strip.text = element_text(face = "bold"), 
+        axis.ticks.x = element_blank(), axis.text = element_text(color = "black"), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+p + facet_wrap("protein_name", scales = "free_y") + 
+  guides(fill = FALSE) + 
+  geom_boxplot(aes_string(x = "Severity.current.final"), alpha = 0.25, outlier.color = NA) + 
+  geom_point(size = 4, position = position_jitter(width = 0.25), aes_string(x = "Severity.current.final", y = "MFI", color = "Severity.max.final", shape = "acuity")) + 
+  theme(panel.grid.major = element_line(color = "grey", size = 0.25), aspect.ratio = 1) + 
+  scale_color_manual(values = severity.cols) + scale_fill_manual(values = severity.cols) + 
+  ggpubr::stat_compare_means(mapping = aes(Severity.current.final), comparisons = my_comparisons, label = "p.signif") +
+  theme(text=element_text(size=20), aspect.ratio = 1) + 
+  NoLegend() + scale_y_continuous(expand = expansion(mult = c(0.05,0.2)))
+
+
+```

@@ -239,6 +239,140 @@ covid.seuAbundances <- function (seu, by = c("orig.ident", "seurat_clusters", "c
   
 } 
 
+covid.seuAbundances.meta <- function (seu, by = c("orig.ident", "seurat_clusters", "cell.type"),
+                                 meta.include = NULL, group_by = NULL, shape_by = NULL, each.pt = "orig.ident",
+                                 custom_fill_colors = NULL, group_by.point = NULL, color_by = NULL, 
+                                 pb = FALSE, correct = FALSE, comparisons = my_comparisons, 
+                                 ncol = 4, label = "p.signif", select.idents = NULL, 
+                                 label.x = NA, pt.size = NA) 
+{
+  by <- match.arg(by)
+  if (is.null(group_by)){
+    group_by <- "null.group" 
+  } 
+  shapes <- NULL
+  if (!is.null(shape_by)) {
+    shapes <- c(16, 17, 15, 3, 7, 8)
+    if ((length(unique((seu[[shape_by]]))[[1]])) > 6) {
+      if (n > 18) {
+        message(paste("At most 17 shapes are currently supported", 
+                      "but", n, "are required. Setting 'shape_by' to NULL."))
+        shape_by <- NULL
+      }
+      else {
+        new <- setdiff(c(seq_len(16) - 1, 18), shapes)
+        shapes <- c(shapes, new[seq_len(n - 6)])
+      }
+    }
+  }
+  if (by=="cell.type") {
+    fq <- prop.table(table(seu$cell.type, seu[,each.pt]), 2) *100
+    df <- reshape2::melt(fq, value.name = "freq", varnames = c("cell.type", 
+                                                               each.pt))  
+  }
+  else {
+    fq <- prop.table(table(seu$seurat_clusters, seu[,each.pt]), 2) *100
+    df <- reshape2::melt(fq, value.name = "freq", varnames = c("seurat_clusters", 
+                                                               each.pt))  
+  }
+  if (correct) {
+    df <- df[grep("covid", df$orig.ident),]
+    df$WBC <- mapvalues(df$orig.ident, from = covid_metadata.c$orig.ident, 
+                        to = as.numeric(as.character(covid_metadata.c$WBC)))
+    df$WBC <- as.numeric(as.character(df$WBC))
+    df$freq <- df$freq*df$WBC
+    df$WBC <- NULL
+  }
+  # uniques <- apply(seu, 2, function(x) length(unique(x)))
+  # ei <- unique(seu[, names(uniques[uniques<=max(uniques[c(each.pt,"seurat_clusters")])])])
+  meta.include <- c(group_by,color_by,shape_by,group_by.point)
+  ei <- unique(seu[,colnames(seu) %in% c(meta.include,each.pt)])
+  df <- merge(df, ei, by = each.pt)
+  df <- cbind(df, null.group = paste("1"))
+  df[,each.pt] <- as.factor(df[,each.pt])
+  if(pb){
+    df <- df[df$cell.type %in% unique(covid_pb$cell.type),]
+  }
+  if(!is.null(select.idents)) {
+    df <- df[df$cell.type %in% select.idents,]
+    df$cell.type <- factor(df$cell.type, levels = select.idents)
+  }
+  if(correct) {
+    p <- ggplot(df, aes_string(y = "freq", x = group_by)) + labs(x = NULL, 
+                                                                 y = "Cells (x1000/uL)") + theme_bw() + theme(panel.grid.minor = element_blank(), 
+                                                                                                              panel.grid.major = element_blank(), strip.background = element_rect(fill = NA, 
+                                                                                                                                                                                  color = NA), strip.text = element_text(face = "bold"), 
+                                                                                                              axis.ticks.x = element_blank(), axis.text = element_text(color = "black"), 
+                                                                                                              axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  }
+  else {
+    p <- ggplot(df, aes_string(y = "freq", x = group_by)) + labs(x = NULL, 
+                                                                 y = "Proportion (%)") + theme_bw() + theme(panel.grid.minor = element_blank(), 
+                                                                                                            panel.grid.major = element_blank(), strip.background = element_rect(fill = NA, 
+                                                                                                                                                                                color = NA), strip.text = element_text(face = "bold"), 
+                                                                                                            axis.ticks.x = element_blank(), axis.text = element_text(color = "black"), 
+                                                                                                            axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+  }
+  
+  
+  if(by=="cell.type" && color_by=="cell.type") {
+    p + facet_wrap(group_by, scales = "free_x") + 
+      geom_bar(aes_string(x = each.pt, fill = "factor(cell.type)"), 
+               position = "fill", stat = "identity") + scale_fill_manual("cell.type", 
+                                                                         values = cluster_cols) + scale_y_continuous(expand = c(0, 0), labels = seq(0, 100, 25)) + theme(panel.border = element_blank())
+  }
+  else {
+    if(is.null(custom_fill_colors)) {
+      switch(by, orig.ident = p + facet_wrap(group_by, scales = "free_x") + 
+               geom_bar(aes_string(x = "orig.ident", fill = "factor(seurat_clusters)"), 
+                        position = "fill", stat = "identity") + scale_fill_manual("seurat_clusters", 
+                                                                                  values = cluster_cols) + scale_y_continuous(expand = c(0, 0), labels = seq(0, 100, 25)) + theme(panel.border = element_blank()), 
+             seurat_clusters = p + facet_wrap("seurat_clusters", scales = "free_y", 
+                                              ncol = 4) + guides(fill = FALSE) + geom_point(position = position_jitter(width = 0.25), 
+                                                                                            aes_string(x = group_by, y = "freq", color = group_by.point, 
+                                                                                                       shape = shape_by)) + scale_shape_manual(values = shapes) + theme(panel.grid.major = element_line(color = "grey", size = 0.25)) 
+             + geom_line(aes_string(x = group_by, color = group_by.point, group = shape_by)),
+             cell.type = p + facet_wrap("cell.type", scales = "free_y", 
+                                        ncol = 4) + guides(fill = FALSE) + geom_point(position = position_jitter(width = 0.25), 
+                                                                                      aes_string(x = group_by, y = "freq", color = group_by.point, 
+                                                                                                 shape = shape_by)) + scale_shape_manual(values = shapes) + theme(panel.grid.major = element_line(color = "grey", size = 0.25)) 
+             + geom_line(aes_string(x = group_by, color = group_by.point, group = shape_by)))
+    }
+    else {
+      switch(by, orig.ident = p + facet_wrap(group_by, scales = "free_x") + 
+               geom_bar(aes_string(x = "orig.ident", fill = "factor(seurat_clusters)"), 
+                        position = "fill", stat = "identity") + scale_fill_manual("seurat_clusters", 
+                                                                                  values = cluster_cols) + scale_y_continuous(expand = c(0, 
+                                                                                                                                         0), labels = seq(0, 100, 25)) + theme(panel.border = element_blank()) + scale_color_manual(values = custom_fill_colors) + scale_fill_manual(values = custom_fill_colors), 
+             
+             
+             
+             seurat_clusters = p + facet_wrap("seurat_clusters", scales = "free_y", 
+                                              ncol = 4) + guides(fill = FALSE) + geom_boxplot(aes_string(x = group_by, 
+                                                                                                         color = group_by, fill = group_by), position = position_dodge(), 
+                                                                                              alpha = 0.25, outlier.color = NA) + geom_point(position = position_jitter(width = 0.25), 
+                                                                                                                                             aes_string(x = group_by, y = "freq", color = group_by, 
+                                                                                                                                                        shape = shape_by)) + scale_shape_manual(values = shapes) + 
+               theme(panel.grid.major = element_line(color = "grey", 
+                                                     size = 0.25)) + scale_color_manual(values = custom_fill_colors) + scale_fill_manual(values = custom_fill_colors),
+             
+             
+             
+             
+             cell.type = p + facet_wrap("cell.type", scales = "free_y", 
+                                        ncol = ncol) + guides(fill = FALSE) + geom_boxplot(aes_string(x = group_by), 
+                                                                                           alpha = 0.25, outlier.color = NA) + geom_point(size = 4, position = position_jitter(width = 0.25), 
+                                                                                                                                          aes_string(x = group_by, y = "freq", color = color_by, 
+                                                                                                                                                     shape = shape_by)) + scale_shape_manual(values = shapes) + 
+               theme(panel.grid.major = element_line(color = "grey", 
+                                                     size = 0.25)) + scale_color_manual(values = custom_fill_colors) + scale_fill_manual(values = custom_fill_colors)) + ggpubr::stat_compare_means(mapping = aes_string(group_by), comparisons = comparisons, label = label)
+    }
+    
+    
+    
+  }
+  
+} 
 
 #numeric abundance function (used when the x-axis is numeric, correlation coeffs are calculated)
 covid.seuAbundances.num <- function (seu, by = c("orig.ident", "seurat_clusters", "cell.type"),
@@ -943,8 +1077,8 @@ processNewSeurat <- function(parent.object, idents = NULL, cells = NULL) {
 
 
 
-myFeaturePlot <- function(object = NULL, features = features, ncol = NULL, save = T, save.as = "png", height = 7, width = 7, cols = c("lightgrey", "blue"), reduction = "umap", facet.size = 20, feature.face = "bold.italic") {
-  plots <- lapply(features, function(x) {FeaturePlot(object,features = x, cols = cols, reduction = reduction) +  labs(x = "UMAP1", y = "UMAP2") + 
+myFeaturePlot <- function(object = NULL, features = features, ncol = NULL, save = T, save.as = "png", height = 7, width = 7, cols = c("lightgrey", "blue"), reduction = "umap", facet.size = 20, feature.face = "bold.italic", order.cells=T) {
+  plots <- lapply(features, function(x) {FeaturePlot(object,features = x, cols = cols, reduction = reduction, order = order.cells) +  labs(x = "UMAP1", y = "UMAP2") + 
       theme(aspect.ratio = 1, 
             axis.text.y = element_blank(), 
             axis.ticks.y = element_blank(), 
